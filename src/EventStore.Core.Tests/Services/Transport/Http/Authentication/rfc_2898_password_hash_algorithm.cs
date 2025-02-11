@@ -1,4 +1,7 @@
-﻿using EventStore.Core.Services.Transport.Http.Authentication;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using EventStore.Core.Services.Transport.Http.Authentication;
 using NUnit.Framework;
 
 namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
@@ -53,6 +56,24 @@ namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
 			[Test]
 			public void generates_different_hashes() {
 				Assert.That(_hash1 != _hash2);
+			}
+		}
+		
+		[TestFixture]
+		public class when_upgrading_the_hashes {
+			private Rfc2898PasswordHashAlgorithm _algorithm;
+			private readonly string _password = "Pa55w0rd!";
+			private readonly string _hash = "HKoq6xw3Oird4KqU4RyoY9aFFRc=";
+			private readonly string _salt = "+6eoSEkays/BOpzGMLE6Uw==";
+
+			[SetUp]
+			public void SetUp() {
+				_algorithm = new Rfc2898PasswordHashAlgorithm();
+			}
+
+			[Test]
+			public void old_hashes_should_successfully_verify() {
+				Assert.True(_algorithm.Verify(_password, _hash, _salt));
 			}
 		}
 	}

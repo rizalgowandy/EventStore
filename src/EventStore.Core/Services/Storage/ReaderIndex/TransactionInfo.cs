@@ -1,11 +1,6 @@
-namespace EventStore.Core.Services.Storage.ReaderIndex {
-	public struct TransactionInfo<TStreamId> {
-		public readonly int TransactionOffset;
-		public readonly TStreamId EventStreamId;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-		public TransactionInfo(int transactionOffset, TStreamId eventStreamId) {
-			TransactionOffset = transactionOffset;
-			EventStreamId = eventStreamId;
-		}
-	}
-}
+namespace EventStore.Core.Services.Storage.ReaderIndex;
+
+public readonly record struct TransactionInfo<TStreamId>(int TransactionOffset, TStreamId EventStreamId);

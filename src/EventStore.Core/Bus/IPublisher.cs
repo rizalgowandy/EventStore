@@ -1,14 +1,14 @@
-﻿using EventStore.Core.Messaging;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Bus {
-	public interface IPublisher {
-		void Publish(Message message);
-	}
+using EventStore.Core.Messaging;
 
-	/// <summary>
-	/// Marks <see cref="IPublisher"/> as being OK for
-	/// cross-thread publishing (e.g. in replying to envelopes).
-	/// </summary>
-	public interface IThreadSafePublisher {
-	}
+namespace EventStore.Core.Bus;
+
+public interface IPublisher : IHandle<Message>, IEnvelope {
+	void Publish(Message message);
+
+	void IHandle<Message>.Handle(Message message) => Publish(message);
+
+	void IEnvelope<Message>.ReplyWith<T>(T message) => Publish(message);
 }

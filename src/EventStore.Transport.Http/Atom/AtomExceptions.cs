@@ -1,30 +1,17 @@
-﻿using System;
-using System.Runtime.Serialization;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Transport.Http.Atom {
-	public class AtomSpecificationViolationException : Exception {
-		public AtomSpecificationViolationException() {
-		}
+using System;
 
-		public AtomSpecificationViolationException(string message) : base(message) {
-		}
+namespace EventStore.Transport.Http.Atom;
 
-		public AtomSpecificationViolationException(string message, Exception innerException) : base(message,
-			innerException) {
-		}
-
-		protected AtomSpecificationViolationException(SerializationInfo info, StreamingContext context) : base(info,
-			context) {
-		}
+public class AtomSpecificationViolationException : Exception {
+	public AtomSpecificationViolationException(string message) : base(message) {
 	}
+}
 
-	public class ThrowHelper {
-		public static void ThrowSpecificationViolation(string message) {
-			throw new AtomSpecificationViolationException(message);
-		}
-
-		public static void ThrowSpecificationViolation(string message, Exception innnerException) {
-			throw new AtomSpecificationViolationException(message, innnerException);
-		}
+public class ThrowHelper {
+	public static void ThrowSpecificationViolation(string message) {
+		throw new AtomSpecificationViolationException(message);
 	}
 }

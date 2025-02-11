@@ -1,22 +1,16 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using EventStore.Core.Messaging;
 
-namespace EventStore.Core.Messages
-{
-	public static class AuthenticationMessage {
-		public class AuthenticationProviderInitialized : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Core.Messages;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-		}
-		
-		public class AuthenticationProviderInitializationFailed : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+public static partial class AuthenticationMessage {
+	[DerivedMessage(CoreMessage.Authentication)]
+	public partial class AuthenticationProviderInitialized : Message {
+	}
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-		}
+	[DerivedMessage(CoreMessage.Authentication)]
+	public partial class AuthenticationProviderInitializationFailed : Message {
 	}
 }

@@ -1,52 +1,52 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using System.IO;
 using System.Threading.Tasks;
+using DotNext;
 using EventStore.Core.Index;
 using NUnit.Framework;
 
-namespace EventStore.Core.Tests.Index.Scavenge {
-	[TestFixture]
-	public class when_scavenging_an_index_fails : SpecificationWithDirectoryPerTestFixture {
-		private PTable _oldTable;
-		private string _expectedOutputFile;
+namespace EventStore.Core.Tests.Index.Scavenge;
 
-		[OneTimeSetUp]
-		public override async Task TestFixtureSetUp() {
-			await base.TestFixtureSetUp();
+[TestFixture]
+public class when_scavenging_an_index_fails : SpecificationWithDirectoryPerTestFixture {
+	private PTable _oldTable;
+	private string _expectedOutputFile;
 
-			var table = new HashListMemTable(PTableVersions.IndexV4, maxSize: 20);
-			table.Add(0x010100000000, 0, 1);
-			table.Add(0x010200000000, 0, 2);
-			table.Add(0x010300000000, 0, 3);
-			table.Add(0x010300000000, 1, 4);
-			_oldTable = PTable.FromMemtable(table, GetTempFilePath(), Constants.PTableInitialReaderCount, Constants.PTableMaxReaderCountDefault);
+	[OneTimeSetUp]
+	public override async Task TestFixtureSetUp() {
+		await base.TestFixtureSetUp();
 
-			long spaceSaved;
-			Func<IndexEntry, bool> existsAt = x => { throw new Exception("Expected exception"); };
-			Func<IndexEntry, Tuple<string, bool>> readRecord = x => { throw new Exception("Should not be called"); };
-			Func<string, ulong, ulong> upgradeHash = (streamId, hash) => {
-				throw new Exception("Should not be called");
-			};
+		var table = new HashListMemTable(PTableVersions.IndexV4, maxSize: 20);
+		table.Add(0x010100000000, 0, 1);
+		table.Add(0x010200000000, 0, 2);
+		table.Add(0x010300000000, 0, 3);
+		table.Add(0x010300000000, 1, 4);
+		_oldTable = PTable.FromMemtable(table, GetTempFilePath(), Constants.PTableInitialReaderCount, Constants.PTableMaxReaderCountDefault);
 
-			_expectedOutputFile = GetTempFilePath();
-			Assert.That(
-				() => PTable.Scavenged(_oldTable, _expectedOutputFile, upgradeHash, existsAt, readRecord,
-					PTableVersions.IndexV4, out spaceSaved, initialReaders: Constants.PTableInitialReaderCount, maxReaders: Constants.PTableMaxReaderCountDefault,
-					useBloomFilter: true),
-				Throws.Exception.With.Message.EqualTo("Expected exception"));
-		}
+		Func<IndexEntry, bool> existsAt = x => { throw new Exception("Expected exception"); };
 
-		[OneTimeTearDown]
-		public override Task TestFixtureTearDown() {
-			_oldTable.Dispose();
+		_expectedOutputFile = GetTempFilePath();
+		var ex = Assert.ThrowsAsync<Exception>(async () => await PTable.Scavenged(_oldTable, _expectedOutputFile,
+			PTableVersions.IndexV4, existsAt.ToAsync(), initialReaders: Constants.PTableInitialReaderCount,
+			maxReaders: Constants.PTableMaxReaderCountDefault,
+			useBloomFilter: true));
 
-			return base.TestFixtureTearDown();
-		}
+		Assert.AreEqual("Expected exception", ex?.Message);
+	}
 
-		[Test]
-		public void the_output_file_is_deleted() {
-			Assert.That(File.Exists(_expectedOutputFile), Is.False);
-			Assert.That(File.Exists(PTable.GenBloomFilterFilename(_expectedOutputFile)), Is.False);
-		}
+	[OneTimeTearDown]
+	public override Task TestFixtureTearDown() {
+		_oldTable.Dispose();
+
+		return base.TestFixtureTearDown();
+	}
+
+	[Test]
+	public void the_output_file_is_deleted() {
+		Assert.That(File.Exists(_expectedOutputFile), Is.False);
+		Assert.That(File.Exists(PTable.GenBloomFilterFilename(_expectedOutputFile)), Is.False);
 	}
 }

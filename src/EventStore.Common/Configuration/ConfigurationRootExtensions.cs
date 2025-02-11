@@ -1,27 +1,28 @@
-using System;
-using System.Linq;
-using System.Reflection;
-using Microsoft.Extensions.Configuration;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
 #nullable enable
-namespace EventStore.Common.Configuration {
-	public static class ConfigurationRootExtensions {
-		public static void Validate<TOptions>(this IConfigurationRoot configurationRoot) {
-			var options = typeof(TOptions).GetProperties()
-				.SelectMany(
-					property => property.PropertyType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
-				.Select(x => x.Name)
-				.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-			foreach (var (key, _) in configurationRoot.AsEnumerable()) {
-				if (!options.Contains(key)) {
-					throw new ArgumentException($"The option {key} is not a known option.", key);
-				}
+using System;
+using Microsoft.Extensions.Configuration;
+
+namespace EventStore.Common.Configuration;
+
+public static class ConfigurationRootExtensions {
+	private static readonly string[] INVALID_DELIMITERS = [";", "\t"];
+
+	public static string[] GetCommaSeparatedValueAsArray(this IConfiguration configuration, string key) {
+		var value = configuration.GetValue<string?>(key);
+		if (string.IsNullOrEmpty(value)) {
+			return Array.Empty<string>();
+		}
+
+		foreach (var invalidDelimiter in INVALID_DELIMITERS) {
+			if (value.Contains(invalidDelimiter)) {
+				throw new ArgumentException($"Invalid delimiter {invalidDelimiter} for {key}");
 			}
 		}
 
-		public static string[] GetCommaSeparatedValueAsArray(this IConfigurationRoot configurationRoot, string key) =>
-			configurationRoot.GetValue<string?>(key)?.Split(',', StringSplitOptions.RemoveEmptyEntries) ??
-			Array.Empty<string>();
+		return value.Split(',', StringSplitOptions.RemoveEmptyEntries);
 	}
 }

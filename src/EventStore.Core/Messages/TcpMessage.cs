@@ -1,151 +1,109 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Net.Sockets;
 using EventStore.Core.Messaging;
 using EventStore.Core.Services.Transport.Tcp;
 
-namespace EventStore.Core.Messages {
-	public static class TcpMessage {
-		public class TcpSend : Message, IQueueAffineMessage {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Core.Messages;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public int QueueId {
-				get { return ConnectionManager.GetHashCode(); }
-			}
-
-			public readonly TcpConnectionManager ConnectionManager;
-			public readonly Message Message;
-
-			public TcpSend(TcpConnectionManager connectionManager, Message message) {
-				ConnectionManager = connectionManager;
-				Message = message;
-			}
+public static partial class TcpMessage {
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class TcpSend : Message, IQueueAffineMessage {
+		public int QueueId {
+			get { return ConnectionManager.GetHashCode(); }
 		}
 
-		public class Heartbeat : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+		public readonly TcpConnectionManager ConnectionManager;
+		public readonly Message Message;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly long ReceiveProgressIndicator;
-			public readonly long SendProgressIndicator;
-
-			public Heartbeat(long receiveProgressIndicator, long sendProgressIndicator) {
-				ReceiveProgressIndicator = receiveProgressIndicator;
-				SendProgressIndicator = sendProgressIndicator;
-			}
+		public TcpSend(TcpConnectionManager connectionManager, Message message) {
+			ConnectionManager = connectionManager;
+			Message = message;
 		}
+	}
 
-		public class HeartbeatTimeout : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class Heartbeat : Message {
+		public readonly long ReceiveProgressIndicator;
+		public readonly long SendProgressIndicator;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly long ReceiveProgressIndicator;
-
-			public HeartbeatTimeout(long receiveProgressIndicator) {
-				ReceiveProgressIndicator = receiveProgressIndicator;
-			}
+		public Heartbeat(long receiveProgressIndicator, long sendProgressIndicator) {
+			ReceiveProgressIndicator = receiveProgressIndicator;
+			SendProgressIndicator = sendProgressIndicator;
 		}
+	}
 
-		public class PongMessage : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class HeartbeatTimeout : Message {
+		public readonly long ReceiveProgressIndicator;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly Guid CorrelationId;
-			public readonly byte[] Payload;
-
-			public PongMessage(Guid correlationId, byte[] payload) {
-				CorrelationId = correlationId;
-				Payload = payload;
-			}
+		public HeartbeatTimeout(long receiveProgressIndicator) {
+			ReceiveProgressIndicator = receiveProgressIndicator;
 		}
+	}
 
-		public class ConnectionEstablished : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class PongMessage : Message {
+		public readonly Guid CorrelationId;
+		public readonly byte[] Payload;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly TcpConnectionManager Connection;
-
-			public ConnectionEstablished(TcpConnectionManager connection) {
-				Connection = connection;
-			}
+		public PongMessage(Guid correlationId, byte[] payload) {
+			CorrelationId = correlationId;
+			Payload = payload;
 		}
+	}
 
-		public class ConnectionClosed : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class ConnectionEstablished : Message {
+		public readonly TcpConnectionManager Connection;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly TcpConnectionManager Connection;
-			public readonly SocketError SocketError;
-
-			public ConnectionClosed(TcpConnectionManager connection, SocketError socketError) {
-				Connection = connection;
-				SocketError = socketError;
-			}
+		public ConnectionEstablished(TcpConnectionManager connection) {
+			Connection = connection;
 		}
+	}
 
-		public class NotReady : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class ConnectionClosed : Message {
+		public readonly TcpConnectionManager Connection;
+		public readonly SocketError SocketError;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly Guid CorrelationId;
-			public readonly string Reason;
-
-			public NotReady(Guid correlationId, string reason) {
-				CorrelationId = correlationId;
-				Reason = reason;
-			}
+		public ConnectionClosed(TcpConnectionManager connection, SocketError socketError) {
+			Connection = connection;
+			SocketError = socketError;
 		}
+	}
 
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class NotReady : Message {
+		public readonly Guid CorrelationId;
+		public readonly string Reason;
 
-		public class NotAuthenticated : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly Guid CorrelationId;
-			public readonly string Reason;
-
-			public NotAuthenticated(Guid correlationId, string reason) {
-				CorrelationId = correlationId;
-				Reason = reason;
-			}
+		public NotReady(Guid correlationId, string reason) {
+			CorrelationId = correlationId;
+			Reason = reason;
 		}
+	}
 
-		public class Authenticated : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class NotAuthenticated : Message {
+		public readonly Guid CorrelationId;
+		public readonly string Reason;
 
-			public readonly Guid CorrelationId;
+		public NotAuthenticated(Guid correlationId, string reason) {
+			CorrelationId = correlationId;
+			Reason = reason;
+		}
+	}
 
-			public Authenticated(Guid correlationId) {
-				CorrelationId = correlationId;
-			}
+	[DerivedMessage(CoreMessage.Tcp)]
+	public partial class Authenticated : Message {
+		public readonly Guid CorrelationId;
+
+		public Authenticated(Guid correlationId) {
+			CorrelationId = correlationId;
 		}
 	}
 }

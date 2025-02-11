@@ -1,11 +1,14 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Exceptions {
-	public class CorruptDatabaseException : Exception {
-		public CorruptDatabaseException(Exception inner) : base("Corrupt database detected.", inner) {
-		}
+using System;
 
-		public CorruptDatabaseException(string message, Exception inner) : base(message, inner) {
-		}
+namespace EventStore.Core.Exceptions;
+
+public class CorruptDatabaseException : Exception {
+	public CorruptDatabaseException(Exception inner) : base("Corrupt database detected.", inner) {
+	}
+
+	public CorruptDatabaseException(string message, Exception inner) : base(message, inner) {
 	}
 }

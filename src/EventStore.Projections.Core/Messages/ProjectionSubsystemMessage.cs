@@ -1,117 +1,82 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Projections.Core.Messages {
-	public static class ProjectionSubsystemMessage {
-	
-		public class RestartSubsystem : Message  {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Projections.Core.Messages;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public IEnvelope ReplyEnvelope { get; }
-			
-			public RestartSubsystem(IEnvelope replyEnvelope) {
-				ReplyEnvelope = replyEnvelope;
-			}
-		}
-
-		public class InvalidSubsystemRestart : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public string SubsystemState { get; }
-
-			public InvalidSubsystemRestart(string subsystemState) {
-				SubsystemState = subsystemState;
-			}
-		}
-
-		public class SubsystemRestarting : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-		}
-
-		public class StartComponents : Message  {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public Guid InstanceCorrelationId { get; }
-
-			public StartComponents(Guid instanceCorrelationId) {
-				InstanceCorrelationId = instanceCorrelationId;
-			}
-		}	
-			
-		public class ComponentStarted : Message  {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public string ComponentName { get; }
-			public Guid InstanceCorrelationId { get; }
-
-			public ComponentStarted(string componentName, Guid instanceCorrelationId) {
-				ComponentName = componentName;
-				InstanceCorrelationId = instanceCorrelationId;
-			}
-		}	
-	
-		public class StopComponents : Message  {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public Guid InstanceCorrelationId { get; }
-
-			public StopComponents(Guid instanceCorrelationId) {
-				InstanceCorrelationId = instanceCorrelationId;
-			}
-		}
+public static partial class ProjectionSubsystemMessage {
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class RestartSubsystem : Message  {
+		public IEnvelope ReplyEnvelope { get; }
 		
-		public class ComponentStopped : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public string ComponentName { get; }
-			public Guid InstanceCorrelationId { get; }
-
-			public ComponentStopped(string componentName, Guid instanceCorrelationId) {
-				ComponentName = componentName;
-				InstanceCorrelationId = instanceCorrelationId;
-			}
+		public RestartSubsystem(IEnvelope replyEnvelope) {
+			ReplyEnvelope = replyEnvelope;
 		}
+	}
 
-		public class IODispatcherDrained : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class InvalidSubsystemRestart : Message {
+		public string SubsystemState { get; }
+		public string Reason { get; }
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public string ComponentName { get; }
+		public InvalidSubsystemRestart(string subsystemState, string reason) {
+			SubsystemState = subsystemState;
+			Reason = reason;
+		}
+	}
 
-			public IODispatcherDrained(string componentName) {
-				ComponentName = componentName;
-			}
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class SubsystemRestarting : Message {
+	}
+
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class StartComponents : Message  {
+		public Guid InstanceCorrelationId { get; }
+
+		public StartComponents(Guid instanceCorrelationId) {
+			InstanceCorrelationId = instanceCorrelationId;
+		}
+	}	
+		
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class ComponentStarted : Message  {
+		public string ComponentName { get; }
+		public Guid InstanceCorrelationId { get; }
+
+		public ComponentStarted(string componentName, Guid instanceCorrelationId) {
+			ComponentName = componentName;
+			InstanceCorrelationId = instanceCorrelationId;
+		}
+	}	
+
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class StopComponents : Message  {
+		public Guid InstanceCorrelationId { get; }
+
+		public StopComponents(Guid instanceCorrelationId) {
+			InstanceCorrelationId = instanceCorrelationId;
+		}
+	}
+	
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class ComponentStopped : Message {
+		public string ComponentName { get; }
+		public Guid InstanceCorrelationId { get; }
+
+		public ComponentStopped(string componentName, Guid instanceCorrelationId) {
+			ComponentName = componentName;
+			InstanceCorrelationId = instanceCorrelationId;
+		}
+	}
+
+	[DerivedMessage(ProjectionMessage.Subsystem)]
+	public partial class IODispatcherDrained : Message {
+		public string ComponentName { get; }
+
+		public IODispatcherDrained(string componentName) {
+			ComponentName = componentName;
 		}
 	}
 }

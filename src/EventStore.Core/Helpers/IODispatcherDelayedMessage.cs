@@ -1,39 +1,37 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Core.Helpers {
-	public sealed class IODispatcherDelayedMessage : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Core.Helpers;
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
+[DerivedMessage(CoreMessage.IODispatcher)]
+public sealed partial class IODispatcherDelayedMessage : Message {
+	private readonly Guid _correlationId;
+	private readonly ICorrelatedTimeout _timeout;
+	private readonly Guid? _messageCorrelationId;
 
-		private readonly Guid _correlationId;
-		private readonly Action _action;
-		private readonly Guid? _messageCorrelationId;
+	public IODispatcherDelayedMessage(Guid correlationId, ICorrelatedTimeout timeout) {
+		_timeout = timeout;
+		_correlationId = correlationId;
+	}
 
-		public IODispatcherDelayedMessage(Guid correlationId, Action action) {
-			_action = action;
-			_correlationId = correlationId;
-		}
+	public IODispatcherDelayedMessage(Guid correlationId, ICorrelatedTimeout timeout, Guid messageCorrelationId) {
+		_timeout = timeout;
+		_correlationId = correlationId;
+		_messageCorrelationId = messageCorrelationId;
+	}
 
-		public IODispatcherDelayedMessage(Guid correlationId, Action action, Guid? messageCorrelationId) {
-			_action = action;
-			_correlationId = correlationId;
-			_messageCorrelationId = messageCorrelationId;
-		}
+	public void Timeout() {
+		_timeout.Timeout(_messageCorrelationId ?? Guid.Empty);
+	}
 
-		public Action Action {
-			get { return _action; }
-		}
+	public Guid CorrelationId {
+		get { return _correlationId; }
+	}
 
-		public Guid CorrelationId {
-			get { return _correlationId; }
-		}
-
-		public Guid? MessageCorrelationId {
-			get { return _messageCorrelationId; }
-		}
+	public Guid? MessageCorrelationId {
+		get { return _messageCorrelationId; }
 	}
 }

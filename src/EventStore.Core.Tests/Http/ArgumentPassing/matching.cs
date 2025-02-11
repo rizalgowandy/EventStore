@@ -1,4 +1,7 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using System.Net;
 using System.Threading.Tasks;
 using EventStore.Core.Tests.Helpers;
@@ -32,34 +35,19 @@ namespace EventStore.Core.Tests.Http.ArgumentPassing {
 			[TestCase("%20", " ", "2", "2")] // space
 			[TestCase("%25", "%", "2", "2")] // %
 			public async Task returns_ok_status_code(string _a, string _ra, string _b, string _rb) {
-				_response = await GetJson2<JObject>("/test-encoding/" + _a, "b=" + _b);
+				_response = await GetJson<JObject>("/test-encoding/" + _a, extra: "b=" + _b);
 				Assert.AreEqual(HttpStatusCode.OK, _lastResponse.StatusCode);
 				HelperExtensions.AssertJson(new { a = _ra, b = _rb }, _response);
 			}
-		}
-
-		[Category("LongRunning")]
-		[Ignore("Only demonstrates differences between .NET and Mono")]
-		[TestFixture(typeof(LogFormat.V2), typeof(string))]
-		[TestFixture(typeof(LogFormat.V3), typeof(uint))]
-		class when_matching_against_placeholders_with_reserved_characters<TLogFormat, TStreamId> : HttpBehaviorSpecification<TLogFormat, TStreamId> {
-			private JObject _response;
-
-			protected override Task Given() => Task.CompletedTask;
-			protected override Task When() => Task.CompletedTask;
 
 			[Test]
-			// [TestCase("%24", "$", "2", "2")]
-			// [TestCase("$", "$", "2", "2")]
-			// [TestCase("%3F", "?", "2", "2")] // ?
-			// [TestCase("%2F", "/", "2", "2")] // /
-			// [TestCase("%20", " ", "2", "2")] // space
-			// [TestCase("%25", "%", "2", "2")] // %
-			public async Task returns_ok_status_code(string _a, string _ra, string _b, string _rb) {
-				_response = await GetJson2<JObject>("/test-encoding-reserved-" + _a, "?b=" + _b);
+			[TestCase("*/*")]
+			[TestCase("application/json")]
+			[TestCase("application/json,*/*;q=0.1")]
+			public async Task can_specify_multple_accepts(string accept) {
+				_response = await GetJson<JObject>("/test-encoding/1", accept: accept);
 				Assert.AreEqual(HttpStatusCode.OK, _lastResponse.StatusCode);
-				Console.WriteLine(_response.ToString());
-				HelperExtensions.AssertJson(new { a = _ra, b = _rb }, _response);
+				HelperExtensions.AssertJson(new { a = "1" }, _response);
 			}
 		}
 	}

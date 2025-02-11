@@ -1,3 +1,6 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Linq;
 using System.Text.Json;
@@ -17,13 +20,13 @@ namespace EventStore.Client.Projections {
 
 namespace EventStore.Projections.Core.Services.Grpc {
 	internal partial class ProjectionManagement : EventStore.Client.Projections.Projections.ProjectionsBase {
-		private readonly IQueuedHandler _queue;
+		private readonly IPublisher _publisher;
 		private readonly IAuthorizationProvider _authorizationProvider;
 
-		public ProjectionManagement(IQueuedHandler queue, IAuthorizationProvider authorizationProvider) {
-			if (queue == null) throw new ArgumentNullException(nameof(queue));
+		public ProjectionManagement(IPublisher publisher, IAuthorizationProvider authorizationProvider) {
+			if (publisher == null) throw new ArgumentNullException(nameof(publisher));
 			if (authorizationProvider == null) throw new ArgumentNullException(nameof(authorizationProvider));
-			_queue = queue;
+			_publisher = publisher;
 			_authorizationProvider = authorizationProvider;
 		}
 
@@ -35,6 +38,9 @@ namespace EventStore.Projections.Core.Services.Grpc {
 			new RpcException(
 				new Status(StatusCode.FailedPrecondition,
 					$"Projection Subsystem cannot be restarted as it is in the wrong state: {state}"));
+
+		private static Exception ProjectionNotFound(string name) =>
+			new RpcException(new Status(StatusCode.NotFound, $"Projection '{name}' not found"));
 
 		private static Value GetProtoValue(JsonElement element) =>
 			element.ValueKind switch {

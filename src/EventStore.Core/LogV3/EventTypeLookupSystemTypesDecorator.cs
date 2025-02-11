@@ -1,23 +1,26 @@
-﻿using EventStore.Core.LogAbstraction;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.LogV3
-{
-	public class EventTypeLookupSystemTypesDecorator : INameLookup<uint> {
-		private readonly INameLookup<uint> _wrapped;
+using System.Threading;
+using System.Threading.Tasks;
+using DotNext;
+using EventStore.Core.LogAbstraction;
 
-		public EventTypeLookupSystemTypesDecorator(INameLookup<uint> wrapped) {
-			_wrapped = wrapped;
-		}
+namespace EventStore.Core.LogV3;
 
-		public bool TryGetName(uint eventTypeId, out string name) {
-			if (LogV3SystemEventTypes.TryGetVirtualEventType(eventTypeId, out name))
-				return true;
+public class EventTypeLookupSystemTypesDecorator : INameLookup<uint> {
+	private readonly INameLookup<uint> _wrapped;
 
-			return _wrapped.TryGetName(eventTypeId, out name);
-		}
-
-		public bool TryGetLastValue(out uint last) {
-			return _wrapped.TryGetLastValue(out last);
-		}
+	public EventTypeLookupSystemTypesDecorator(INameLookup<uint> wrapped) {
+		_wrapped = wrapped;
 	}
+
+	public ValueTask<string> LookupName(uint eventTypeId, CancellationToken token) {
+		return LogV3SystemEventTypes.TryGetVirtualEventType(eventTypeId, out var name)
+			? new(name)
+			: _wrapped.LookupName(eventTypeId, token);
+	}
+
+	public ValueTask<Optional<uint>> TryGetLastValue(CancellationToken token)
+		=> _wrapped.TryGetLastValue(token);
 }

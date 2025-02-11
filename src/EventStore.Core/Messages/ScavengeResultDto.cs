@@ -1,18 +1,19 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Messages {
-	public class ScavengeResultDto {
-		public string ScavengeId { get; set; }
+using System;
 
-		public ScavengeResultDto() {
-		}
+namespace EventStore.Core.Messages;
 
-		public ScavengeResultDto(string scavengeId) {
-			ScavengeId = scavengeId;
-		}
+public class ScavengeResultDto {
+	public string ScavengeId { get; set; }
 
-		public override string ToString() {
-			return String.Format("ScavengeId: {0}", ScavengeId);
-		}
+	public ScavengeResultDto() {
 	}
+
+	public ScavengeResultDto(string scavengeId) {
+		ScavengeId = scavengeId;
+	}
+
+	public override string ToString() => $"ScavengeId: {ScavengeId}";
 }

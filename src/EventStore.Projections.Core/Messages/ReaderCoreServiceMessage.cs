@@ -1,34 +1,27 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Projections.Core.Messages {
-	public static class ReaderCoreServiceMessage {
-		public class StartReader : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Projections.Core.Messages;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public Guid InstanceCorrelationId { get; }
+public static partial class ReaderCoreServiceMessage {
+	[DerivedMessage(ProjectionMessage.ReaderCoreService)]
+	public partial class StartReader : Message {
+		public Guid InstanceCorrelationId { get; }
 
-			public StartReader(Guid instanceCorrelationId) {
-				InstanceCorrelationId = instanceCorrelationId;
-			}
+		public StartReader(Guid instanceCorrelationId) {
+			InstanceCorrelationId = instanceCorrelationId;
 		}
+	}
 
-		public class StopReader : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public Guid QueueId { get; }
-			
-			public StopReader(Guid queueId) {
-				QueueId = queueId;
-			}
+	[DerivedMessage(ProjectionMessage.ReaderCoreService)]
+	public partial class StopReader : Message {
+		public Guid QueueId { get; }
+		
+		public StopReader(Guid queueId) {
+			QueueId = queueId;
 		}
 	}
 }

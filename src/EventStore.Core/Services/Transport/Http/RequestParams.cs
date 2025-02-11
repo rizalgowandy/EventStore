@@ -1,23 +1,26 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Services.Transport.Http {
-	public struct RequestParams {
-		public readonly bool IsDone;
-		public readonly TimeSpan Timeout;
+using System;
 
-		public RequestParams(bool done) {
-			IsDone = done;
-			Timeout = TimeSpan.Zero;
-		}
+namespace EventStore.Core.Services.Transport.Http;
 
-		public RequestParams(TimeSpan timeout) {
-			IsDone = false;
-			Timeout = timeout;
-		}
+public struct RequestParams {
+	public readonly bool IsDone;
+	public readonly TimeSpan Timeout;
 
-		public RequestParams(bool done, TimeSpan timeout) {
-			IsDone = done;
-			Timeout = timeout;
-		}
+	public RequestParams(bool done) {
+		IsDone = done;
+		Timeout = TimeSpan.Zero;
+	}
+
+	public RequestParams(TimeSpan timeout) {
+		IsDone = false;
+		Timeout = timeout;
+	}
+
+	public RequestParams(bool done, TimeSpan timeout) {
+		IsDone = done;
+		Timeout = timeout;
 	}
 }

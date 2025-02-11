@@ -1,9 +1,10 @@
+#pragma warning disable IDE0073 // The file header does not match the required text
 //----------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //----------------------------------------------------------------
 
-namespace System
-{
+namespace System;
+
     using System.Collections.Specialized;
     using System.Diagnostics;
     using System.Runtime;
@@ -86,4 +87,3 @@ namespace System
         public abstract bool IsMatch(UriTemplateLiteralPathSegment segment, bool ignoreTrailingSlash);
         public abstract void Lookup(string segment, NameValueCollection boundParameters);
     }
-}

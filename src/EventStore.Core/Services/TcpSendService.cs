@@ -1,18 +1,14 @@
-﻿using System.Diagnostics;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using EventStore.Core.Bus;
 using EventStore.Core.Messages;
-using EventStore.Core.Services.Histograms;
 
-namespace EventStore.Core.Services {
-	public class TcpSendService : IHandle<TcpMessage.TcpSend> {
-		private readonly Stopwatch _watch = Stopwatch.StartNew();
-		private const string _tcpSendHistogram = "tcp-send";
+namespace EventStore.Core.Services;
 
-		public void Handle(TcpMessage.TcpSend message) {
-			var start = _watch.ElapsedTicks;
-			message.ConnectionManager.SendMessage(message.Message);
-			HistogramService.SetValue(_tcpSendHistogram,
-				(long)((((double)_watch.ElapsedTicks - start) / Stopwatch.Frequency) * 1000000000));
-		}
+public class TcpSendService : IHandle<TcpMessage.TcpSend> {
+	public void Handle(TcpMessage.TcpSend message) {
+		// todo: histogram metric?
+		message.ConnectionManager.SendMessage(message.Message);
 	}
 }

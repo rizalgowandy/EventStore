@@ -1,9 +1,10 @@
+#pragma warning disable IDE0073 // The file header does not match the required text
 //----------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //----------------------------------------------------------------
 
-namespace System
-{
+namespace System;
+
     using System.Collections.Generic;
     using System.Collections.Specialized;
     using System.Diagnostics;
@@ -385,4 +386,3 @@ namespace System
             }
         }
     }
-}

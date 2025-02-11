@@ -1,67 +1,62 @@
-﻿using System;
-using System.Net.Http;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
+using System.Net;
 using System.Threading;
 using EventStore.Common.Utils;
 using EventStore.Core.Bus;
-using EventStore.Core.Settings;
+using EventStore.Core.Metrics;
+using EventStore.Core.Services.Transport.Http.NodeHttpClientFactory;
 using Grpc.Net.Client;
 using Serilog.Extensions.Logging;
 
-namespace EventStore.Core.Cluster {
-	
-	public partial class EventStoreClusterClient : IDisposable {
-		private readonly EventStore.Cluster.Gossip.GossipClient _gossipClient;
-		private readonly EventStore.Cluster.Elections.ElectionsClient _electionsClient;
-		
-		private readonly GrpcChannel _channel;
-		private readonly IPublisher _bus;
-		public bool Disposed { get; private set; }
+namespace EventStore.Core.Cluster;
 
-		public EventStoreClusterClient(Uri address, IPublisher bus, Func<X509Certificate, X509Chain, SslPolicyErrors, ValueTuple<bool, string>> serverCertValidator, Func<X509Certificate> clientCertificateSelector) {
-			HttpMessageHandler httpMessageHandler = null;
-			if (address.Scheme == Uri.UriSchemeHttps){
-				var socketsHttpHandler = new SocketsHttpHandler {
-					SslOptions = {
-						CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-						RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => {
-							var (isValid, error) = serverCertValidator(certificate, chain, errors);
-							if (!isValid && error != null) {
-								Log.Error("Server certificate validation error: {e}", error);
-							}
 
-							return isValid;
-						},
-						LocalCertificateSelectionCallback = delegate {
-							return clientCertificateSelector();
-						}
-					},
-					PooledConnectionLifetime = ESConsts.HttpClientConnectionLifeTime
-				};
+public partial class EventStoreClusterClient : IDisposable {
+	private readonly EventStore.Cluster.Gossip.GossipClient _gossipClient;
+	private readonly EventStore.Cluster.Elections.ElectionsClient _electionsClient;
 
-				httpMessageHandler = socketsHttpHandler;
-			} else if (address.Scheme == Uri.UriSchemeHttp) {
-				httpMessageHandler = new SocketsHttpHandler();
-			}
+	private readonly GrpcChannel _channel;
+	private readonly IPublisher _bus;
+	private readonly string _clusterDns;
+	private readonly IDurationTracker _gossipSendTracker;
+	private readonly IDurationTracker _gossipGetTracker;
 
-			_channel = GrpcChannel.ForAddress(address, new GrpcChannelOptions {
-				HttpClient = new HttpClient(httpMessageHandler) {
-					Timeout = Timeout.InfiniteTimeSpan,
-					DefaultRequestVersion = new Version(2, 0),
-				},
-				LoggerFactory = new SerilogLoggerFactory()
-			});
-			var callInvoker = _channel.CreateCallInvoker();
-			_gossipClient = new EventStore.Cluster.Gossip.GossipClient(callInvoker);
-			_electionsClient = new EventStore.Cluster.Elections.ElectionsClient(callInvoker);
-			_bus = bus;
-		}
+	public bool Disposed { get; private set; }
 
-		public void Dispose() {
-			if (Disposed) return;
-			_channel.Dispose();
-			Disposed = true;
-		}
+	public EventStoreClusterClient(
+		IPublisher bus,
+		string uriScheme,
+		EndPoint nodeEndPoint,
+		INodeHttpClientFactory nodeHttpClientFactory,
+		string clusterDns,
+		IDurationTracker gossipSendTracker,
+		IDurationTracker gossipGetTracker) {
+
+		_clusterDns = clusterDns;
+
+		var httpClient = nodeHttpClientFactory.CreateHttpClient(nodeEndPoint.GetOtherNames());
+		httpClient.Timeout = Timeout.InfiniteTimeSpan;
+		httpClient.DefaultRequestVersion = new Version(2, 0);
+
+		var address = new UriBuilder(uriScheme, nodeEndPoint.GetHost(), nodeEndPoint.GetPort()).Uri;
+		_channel = GrpcChannel.ForAddress(address, new GrpcChannelOptions {
+			HttpClient = httpClient,
+			LoggerFactory = new SerilogLoggerFactory()
+		});
+		var callInvoker = _channel.CreateCallInvoker();
+		_gossipClient = new EventStore.Cluster.Gossip.GossipClient(callInvoker);
+		_electionsClient = new EventStore.Cluster.Elections.ElectionsClient(callInvoker);
+		_bus = bus;
+		_gossipSendTracker = gossipSendTracker;
+		_gossipGetTracker = gossipGetTracker;
+	}
+
+	public void Dispose() {
+		if (Disposed) return;
+		_channel.Dispose();
+		Disposed = true;
 	}
 }

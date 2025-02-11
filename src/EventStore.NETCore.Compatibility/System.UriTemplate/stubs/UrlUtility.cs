@@ -1,9 +1,10 @@
+#pragma warning disable IDE0073 // The file header does not match the required text
 //------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
-namespace System.Runtime
-{
+namespace System.Runtime;
+
     using System.Collections;
     using System.Collections.Specialized;
     using System.Runtime.Serialization;
@@ -487,11 +488,6 @@ namespace System.Runtime
                 IsReadOnly = false;
             }
 
-            protected HttpValueCollection(SerializationInfo info, StreamingContext context)
-                : base(info, context)
-            {
-            }
-
             internal void FillFromString(string s, bool urlencoded, Encoding encoding)
             {
                 int l = (s != null) ? s.Length : 0;
@@ -631,4 +627,3 @@ namespace System.Runtime
             }
         }
     }
-}

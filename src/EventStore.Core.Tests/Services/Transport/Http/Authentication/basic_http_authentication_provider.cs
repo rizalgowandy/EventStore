@@ -1,4 +1,7 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -12,6 +15,7 @@ using NUnit.Framework;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using EventStore.Plugins.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Primitives;
 
@@ -27,7 +31,7 @@ namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
 
 			protected static HttpContext CreateTestEntityWithCredentials(string username, string password) {
 				var context = new DefaultHttpContext();
-				context.Request.Headers.Add("authorization",
+				context.Request.Headers.Append("authorization",
 					"Basic " + Convert.ToBase64String(Encoding.ASCII.GetBytes($"{username}:{password}")));
 				return context;
 			}
@@ -81,9 +85,47 @@ namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
 
 			[Test]
 			public async Task ShouldAuthenticateUser() {
-				Assert.True(await _request.AuthenticateAsync());
-				Assert.NotNull(_context.User);
-				Assert.AreEqual("user", _context?.User?.Identity?.Name);
+				var (status, principal) = await _request.AuthenticateAsync();
+				Assert.AreEqual(HttpAuthenticationRequestStatus.Authenticated, status);
+				Assert.NotNull(principal);
+				Assert.AreEqual("user", principal?.Identity?.Name);
+			}
+		}
+
+		[TestFixture(typeof(LogFormat.V2), typeof(string))]
+		[TestFixture(typeof(LogFormat.V3), typeof(uint))]
+		public class
+			when_handling_a_request_when_not_ready<TLogFormat, TStreamId> :
+				TestFixtureWithBasicHttpAuthenticationProvider<TLogFormat, TStreamId> {
+			private bool _authenticateResult;
+			private HttpAuthenticationRequest _request;
+			private HttpContext _context;
+
+			protected override void Given() {
+				base.Given();
+				ExistingEvent("$user-user", "$user", null, "{LoginName:'user', Salt:'drowssap',Hash:'password'}");
+			}
+
+			[SetUp]
+			public void SetUp() {
+				SetUpProvider();
+				NotReady();
+				_context = CreateTestEntityWithCredentials("user", "password");
+				_authenticateResult = _provider.Authenticate(_context, out _request);
+			}
+
+			[Test]
+			public void returns_true() {
+				Assert.IsTrue(_authenticateResult);
+				Assert.NotNull(_request);
+			}
+
+			[Test]
+			public async Task ShouldRespondNotReady() {
+				var (status, principal) = await _request.AuthenticateAsync();
+				Assert.AreEqual(HttpAuthenticationRequestStatus.NotReady, status);
+				Assert.Null(principal);
+				Assert.IsEmpty(_context.User.Claims);
 			}
 		}
 
@@ -115,8 +157,10 @@ namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
 
 			[Test]
 			public async Task ShouldNotBeAuthenticated() {
-				Assert.False(await _request.AuthenticateAsync());
+				var (status, principal) = await _request.AuthenticateAsync();
 
+				Assert.AreEqual(HttpAuthenticationRequestStatus.Unauthenticated, status);
+				Assert.Null(principal);
 				Assert.IsEmpty(_context.User.Claims);
 			}
 		}
@@ -154,9 +198,10 @@ namespace EventStore.Core.Tests.Services.Transport.Http.Authentication {
 
 			[Test]
 			public async Task ShouldAuthenticateUser() {
-				Assert.True(await _request.AuthenticateAsync());
-				Assert.NotNull(_context.User);
-				Assert.AreEqual("user", _context?.User?.Identity?.Name);
+				var (status, principal) = await _request.AuthenticateAsync();
+				Assert.AreEqual(HttpAuthenticationRequestStatus.Authenticated, status);
+				Assert.NotNull(principal);
+				Assert.AreEqual("user", principal?.Identity?.Name);
 			}
 		}
 	}

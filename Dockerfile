@@ -1,54 +1,61 @@
-ARG CONTAINER_RUNTIME=focal
-FROM mcr.microsoft.com/dotnet/sdk:5.0-focal AS build
+# "build" image
+ARG CONTAINER_RUNTIME=jammy
+FROM mcr.microsoft.com/dotnet/sdk:8.0-jammy AS build
 ARG RUNTIME=linux-x64
 
-WORKDIR /build/ci
+WORKDIR /build
+COPY ./LICENSE.md .
+COPY ./LICENSE_CONTRIBUTIONS.md .
+COPY ./NOTICE.html .
 
+WORKDIR /build/ci
 COPY ./ci ./
 
 WORKDIR /build/src
-
 COPY ./src/EventStore.sln ./src/*/*.csproj ./src/Directory.Build.* ./
-
 RUN for file in $(ls *.csproj); do mkdir -p ./${file%.*}/ && mv $file ./${file%.*}/; done
-
 RUN dotnet restore --runtime=${RUNTIME}
-
 COPY ./src .
 
 WORKDIR /build/.git
-
-COPY ./.git .
+COPY ./.git/ .
 
 WORKDIR /build/src
+RUN find /build/src -maxdepth 1 -type d -name "*.Tests" -print0 | xargs -I{} -0 -n1 sh -c \
+    'dotnet publish --runtime=${RUNTIME} --no-self-contained --configuration Release --output /build/published-tests/`basename $1` $1' - '{}'
 
-RUN dotnet build --configuration=Release --no-restore
-
-FROM build as test
-ARG RUNTIME=linux-x64
-RUN echo '#!/usr/bin/env sh\n\
-cp /build/src/EventStore.Core.Tests/Services/Transport/Tcp/test_certificates/ca/ca.pem /usr/local/share/ca-certificates/ca_eventstore_test.crt\n\
+# "test" image
+FROM mcr.microsoft.com/dotnet/sdk:8.0-${CONTAINER_RUNTIME} as test
+WORKDIR /build
+COPY --from=build ./build/published-tests ./published-tests
+COPY --from=build ./build/ci ./ci
+COPY --from=build ./build/src/EventStore.Core.Tests/Services/Transport/Tcp/test_certificates/ca/ca.crt /usr/local/share/ca-certificates/ca_eventstore_test.crt
+RUN mkdir ./test-results
+RUN printf '#!/usr/bin/env sh\n\
 update-ca-certificates\n\
-find /build/src -maxdepth 1 -type d -name "*.Tests" -print0 | xargs -I{} -0 -n1 bash -c '"'"'dotnet test --runtime=${RUNTIME} --configuration Release --blame --settings /build/ci/ci.runsettings --logger:"GitHubActions;report-warnings=false" --logger:html --logger:trx --logger:"console;verbosity=normal" --results-directory=/build/test-results/$1 $1'"'"' - '"'"'{}'"'"'\n\
+find /build/published-tests -maxdepth 1 -type d -name "*.Tests" -print0 | xargs -I{} -0 -n1 sh -c '"'"'proj=`basename $1` && dotnet test --blame --blame-hang-timeout 5min --settings /build/ci/ci.runsettings --logger:"GitHubActions;report-warnings=false" --logger:html --logger:trx --logger:"console;verbosity=normal" --results-directory /build/test-results/$proj $1/$proj.dll'"'"' - '"'"'{}'"'"'\n\
 exit_code=$?\n\
 echo $(find /build/test-results -name "*.html" | xargs cat) > /build/test-results/test-results.html\n\
 exit $exit_code' \
     >> /build/test.sh && \
     chmod +x /build/test.sh
+
 CMD ["/build/test.sh"]
 
+# "publish" image
 FROM build as publish
 ARG RUNTIME=linux-x64
 
 RUN dotnet publish --configuration=Release --runtime=${RUNTIME} --self-contained \
-     --framework=net5.0 --output /publish EventStore.ClusterNode
+     --framework=net8.0 --output /publish KurrentDB
 
-FROM mcr.microsoft.com/dotnet/runtime-deps:5.0-${CONTAINER_RUNTIME} AS runtime
+# "runtime" image
+FROM mcr.microsoft.com/dotnet/runtime-deps:8.0-${CONTAINER_RUNTIME} AS runtime
 ARG RUNTIME=linux-x64
 ARG UID=1000
 ARG GID=1000
 
-RUN if [[ "${RUNTIME}" = "alpine-x64" ]];\
+RUN if [[ "${RUNTIME}" = "linux-musl-x64" ]];\
     then \
         apk update && \
         apk add --no-cache \
@@ -60,34 +67,34 @@ RUN if [[ "${RUNTIME}" = "alpine-x64" ]];\
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-WORKDIR /opt/eventstore
+WORKDIR /opt/kurrentdb
 
-RUN addgroup --gid ${GID} "eventstore" && \
+RUN addgroup --gid ${GID} "kurrent" && \
     adduser \
     --disabled-password \
     --gecos "" \
-    --ingroup "eventstore" \
+    --ingroup "kurrent" \
     --no-create-home \
     --uid ${UID} \
-    "eventstore"
+    "kurrent"
 
-COPY --chown=eventstore:eventstore --from=publish /publish ./
+COPY --chown=kurrent:kurrent --from=publish /publish ./
 
-RUN mkdir -p /var/lib/eventstore && \
-    mkdir -p /var/log/eventstore && \
-    mkdir -p /etc/eventstore && \
-    chown -R eventstore:eventstore /var/lib/eventstore /var/log/eventstore /etc/eventstore
+RUN mkdir -p /var/lib/kurrentdb && \
+    mkdir -p /var/log/kurrentdb && \
+    mkdir -p /etc/kurrentdb && \
+    chown -R kurrent:kurrent /var/lib/kurrentdb /var/log/kurrentdb /etc/kurrentdb
 
-USER eventstore
+USER kurrent
 
-RUN printf "ExtIp: 0.0.0.0\n\
-IntIp: 0.0.0.0" >> /etc/eventstore/eventstore.conf
+RUN printf "NodeIp: 0.0.0.0\n\
+ReplicationIp: 0.0.0.0" >> /etc/kurrentdb/kurrentdb.conf
 
-VOLUME /var/lib/eventstore /var/log/eventstore
+VOLUME /var/lib/kurrentdb /var/log/kurrentdb
 
-EXPOSE 1112/tcp 1113/tcp 2112/tcp 2113/tcp
+EXPOSE 1112/tcp 1113/tcp 2113/tcp
 
 HEALTHCHECK --interval=5s --timeout=5s --retries=24 \
     CMD curl --fail --insecure https://localhost:2113/health/live || curl --fail http://localhost:2113/health/live || exit 1
 
-ENTRYPOINT ["/opt/eventstore/EventStore.ClusterNode"]
+ENTRYPOINT ["/opt/kurrentdb/KurrentDB"]

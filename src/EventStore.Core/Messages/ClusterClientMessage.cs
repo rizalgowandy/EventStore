@@ -1,15 +1,13 @@
-﻿using EventStore.Core.Messaging;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Messages {
-	public static class ClusterClientMessage {
-		public class CleanCache : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+using EventStore.Core.Messaging;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
+namespace EventStore.Core.Messages;
 
-			public CleanCache() { }
-		}
+public static partial class ClusterClientMessage {
+	[DerivedMessage(CoreMessage.ClusterClient)]
+	public partial class CleanCache : Message {
+		public CleanCache() { }
 	}
 }

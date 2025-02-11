@@ -1,62 +1,97 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
 using EventStore.Common.Utils;
 using System.Linq;
 
-namespace EventStore.Core.TransactionLog.FileNamingStrategy {
-	public class VersionedPatternFileNamingStrategy : IFileNamingStrategy {
-		private readonly string _path;
-		private readonly string _prefix;
-		private readonly Regex _chunkNamePattern;
+namespace EventStore.Core.TransactionLog.FileNamingStrategy;
 
-		public VersionedPatternFileNamingStrategy(string path, string prefix) {
-			Ensure.NotNull(path, "path");
-			Ensure.NotNull(prefix, "prefix");
-			_path = path;
-			_prefix = prefix;
+public class VersionedPatternFileNamingStrategy : IVersionedFileNamingStrategy {
+	private readonly string _path;
+	private readonly string _prefix;
+	private readonly Regex _pattern;
 
-			_chunkNamePattern = new Regex("^" + _prefix + @"\d{6}\.\w{6}$");
-		}
+	public string Prefix => _prefix;
 
-		public string GetFilenameFor(int index, int version) {
-			Ensure.Nonnegative(index, "index");
-			Ensure.Nonnegative(version, "version");
+	public VersionedPatternFileNamingStrategy(string path, string prefix) {
+		Ensure.NotNull(path, "path");
+		Ensure.NotNull(prefix, "prefix");
+		_path = path;
+		_prefix = prefix;
 
-			return Path.Combine(_path, string.Format("{0}{1:000000}.{2:000000}", _prefix, index, version));
-		}
+		_pattern = new Regex("^" + _prefix + @"\d{6}\.\d{6}$");
+	}
 
-		public string DetermineBestVersionFilenameFor(int index) {
-			var allVersions = GetAllVersionsFor(index);
-			if (allVersions.Length == 0)
-				return GetFilenameFor(index, 0);
-			int lastVersion;
-			if (!int.TryParse(allVersions[0].Substring(allVersions[0].LastIndexOf('.') + 1), out lastVersion))
-				throw new Exception(string.Format("Could not determine version from filename '{0}'.", allVersions[0]));
-			return GetFilenameFor(index, lastVersion + 1);
-		}
+	public string GetFilenameFor(int index, int version) {
+		Ensure.Nonnegative(index, "index");
+		Ensure.Nonnegative(version, "version");
 
-		public string[] GetAllVersionsFor(int index) {
-			var versions = Directory.EnumerateFiles(_path, string.Format("{0}{1:000000}.*", _prefix, index))
-				.Where(x => _chunkNamePattern.IsMatch(Path.GetFileName(x)))
-				.OrderByDescending(x => x, StringComparer.CurrentCultureIgnoreCase)
-				.ToArray();
-			return versions;
-		}
+		return Path.Combine(_path, $"{_prefix}{index:000000}.{version:000000}");
+	}
 
-		public string[] GetAllPresentFiles() {
-			var versions = Directory.EnumerateFiles(_path, string.Format("{0}*.*", _prefix))
-				.Where(x => _chunkNamePattern.IsMatch(Path.GetFileName(x)))
-				.ToArray();
-			return versions;
-		}
+	public string DetermineNewVersionFilenameForIndex(int index, int defaultVersion) {
+		var allVersions = GetAllVersionsFor(index);
 
-		public string GetTempFilename() {
-			return Path.Combine(_path, string.Format("{0}.tmp", Guid.NewGuid()));
-		}
+		if (allVersions.Length == 0)
+			return GetFilenameFor(index, defaultVersion);
 
-		public string[] GetAllTempFiles() {
-			return Directory.GetFiles(_path, "*.tmp");
-		}
+		var lastFile = allVersions[0];
+		var lastVersionSpan = lastFile.AsSpan(lastFile.LastIndexOf('.') + 1);
+		if (!int.TryParse(lastVersionSpan, out var lastVersion))
+			throw new Exception($"Could not determine version from filename '{lastFile}'.");
+
+		return GetFilenameFor(index, lastVersion + 1);
+	}
+
+	public string[] GetAllVersionsFor(int index) {
+		var versions = Directory.EnumerateFiles(_path, $"{_prefix}{index:000000}.*")
+			.Where(x => _pattern.IsMatch(Path.GetFileName(x)))
+			.OrderByDescending(x => x, StringComparer.CurrentCultureIgnoreCase)
+			.ToArray();
+		return versions;
+	}
+
+	public int GetIndexFor(ReadOnlySpan<char> fileName) {
+		if (!_pattern.IsMatch(fileName))
+			throw new ArgumentException($"Invalid file name: {fileName}");
+
+		var start = _prefix.Length;
+		var end = fileName.Slice(_prefix.Length).IndexOf('.');
+
+		if (end < 0 || !int.TryParse(fileName[start..(end + _prefix.Length)], out var fileIndex))
+			throw new ArgumentException($"Invalid file name: {fileName}");
+
+		return fileIndex;
+	}
+
+	public int GetVersionFor(ReadOnlySpan<char> fileName) {
+		if (!_pattern.IsMatch(fileName))
+			throw new ArgumentException($"Invalid file name: {fileName}");
+
+		var dot = fileName.Slice(_prefix.Length).IndexOf('.');
+
+		if (dot < 0 || !int.TryParse(fileName[(dot + 1 + _prefix.Length)..], out var version))
+			throw new ArgumentException($"Invalid file name: {fileName}");
+
+		return version;
+	}
+
+	public string[] GetAllPresentFiles() {
+		var versions = Directory
+			.EnumerateFiles(_path, $"{_prefix}*.*")
+			.Where(x => _pattern.IsMatch(Path.GetFileName(x)))
+			.ToArray();
+		return versions;
+	}
+
+	public string CreateTempFilename() {
+		return Path.Combine(_path, $"{Guid.NewGuid()}.tmp");
+	}
+
+	public string[] GetAllTempFiles() {
+		return Directory.GetFiles(_path, "*.tmp");
 	}
 }

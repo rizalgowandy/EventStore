@@ -1,31 +1,24 @@
-using System.Threading;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using EventStore.Common.Utils;
 using EventStore.Core.Cluster;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Core.Messages {
-	public static class LeaderDiscoveryMessage {
-		public class LeaderFound : Message {
-			private static readonly int TypeId = Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Core.Messages;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
+public static partial class LeaderDiscoveryMessage {
+	[DerivedMessage(CoreMessage.LeaderDiscovery)]
+	public partial class LeaderFound : Message {
+		public readonly MemberInfo Leader;
 
-			public readonly MemberInfo Leader;
-
-			public LeaderFound(MemberInfo leader) {
-				Ensure.NotNull(leader, "leader");
-				Leader = leader;
-			}
+		public LeaderFound(MemberInfo leader) {
+			Ensure.NotNull(leader, "leader");
+			Leader = leader;
 		}
+	}
 
-		public class DiscoveryTimeout : Message {
-			private static readonly int TypeId = Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-		}
+	[DerivedMessage(CoreMessage.LeaderDiscovery)]
+	public partial class DiscoveryTimeout : Message {
 	}
 }

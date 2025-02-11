@@ -1,5 +1,4 @@
-# EditorConfig is awesome:
-http://EditorConfig.org
+# EditorConfig is awesome: https://EditorConfig.org
 
 # top-most EditorConfig file
 root = true
@@ -8,9 +7,17 @@ root = true
 insert_final_newline = true
 indent_style = tab
 indent_size = 4
+trim_trailing_whitespace = true
 
 # C# files
 [*.cs]
+
+charset = utf-8
+
+# License headers
+dotnet_diagnostic.IDE0073.severity = error
+file_header_template = Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.\nKurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 # New line preferences
 csharp_new_line_before_open_brace = none
 csharp_new_line_before_catch = false
@@ -19,6 +26,16 @@ csharp_new_line_before_finally = false
 csharp_new_line_before_members_in_anonymous_types = false
 csharp_new_line_before_members_in_object_initializers = false
 csharp_new_line_within_query_expression_clauses = true
+
+# disable hint to use primary constructor
+dotnet_diagnostic.IDE0290.severity = none
+
+# use file-scoped namespaces
+csharp_style_namespace_declarations = file_scoped
+dotnet_diagnostic.IDE0161.severity = error
+
+# use ValueTasks correctly
+dotnet_diagnostic.CA2012.severity = error
 
 # Indentation preferences
 csharp_indent_block_contents = true
@@ -44,33 +61,34 @@ dotnet_style_predefined_type_for_member_access = true:suggestion
 
 # name all constant fields using PascalCase
 dotnet_naming_rule.constant_fields_should_be_pascal_case.severity = suggestion
-dotnet_naming_rule.constant_fields_should_be_pascal_case.symbols  = constant_fields
-dotnet_naming_rule.constant_fields_should_be_pascal_case.style    = pascal_case_style
+dotnet_naming_rule.constant_fields_should_be_pascal_case.symbols = constant_fields
+dotnet_naming_rule.constant_fields_should_be_pascal_case.style = pascal_case_style
 
-dotnet_naming_symbols.constant_fields.applicable_kinds   = field
+dotnet_naming_symbols.constant_fields.applicable_kinds = field
 dotnet_naming_symbols.constant_fields.required_modifiers = const
 
 dotnet_naming_style.pascal_case_style.capitalization = pascal_case
 
 # static fields should have s_ prefix
 dotnet_naming_rule.static_fields_should_have_prefix.severity = suggestion
-dotnet_naming_rule.static_fields_should_have_prefix.symbols  = static_fields
+dotnet_naming_rule.static_fields_should_have_prefix.style = pascal_case_style
+dotnet_naming_rule.static_fields_should_have_prefix.symbols = static_fields
 
-dotnet_naming_symbols.static_fields.applicable_kinds   = field
+dotnet_naming_symbols.static_fields.applicable_kinds = field
 dotnet_naming_symbols.static_fields.required_modifiers = static
 
-dotnet_naming_style.static_prefix_style.capitalization = pascal_case 
+dotnet_naming_style.static_prefix_style.capitalization = pascal_case
 
 # internal and private fields should be _camelCase
 dotnet_naming_rule.camel_case_for_private_internal_fields.severity = suggestion
-dotnet_naming_rule.camel_case_for_private_internal_fields.symbols  = private_internal_fields
-dotnet_naming_rule.camel_case_for_private_internal_fields.style    = camel_case_underscore_style
+dotnet_naming_rule.camel_case_for_private_internal_fields.symbols = private_internal_fields
+dotnet_naming_rule.camel_case_for_private_internal_fields.style = camel_case_underscore_style
 
 dotnet_naming_symbols.private_internal_fields.applicable_kinds = field
 dotnet_naming_symbols.private_internal_fields.applicable_accessibilities = private, internal
 
 dotnet_naming_style.camel_case_underscore_style.required_prefix = _
-dotnet_naming_style.camel_case_underscore_style.capitalization = camel_case 
+dotnet_naming_style.camel_case_underscore_style.capitalization = camel_case
 
 # Code style defaults
 dotnet_sort_system_directives_first = true
@@ -109,7 +127,7 @@ csharp_space_after_dot = false
 csharp_space_after_keywords_in_control_flow_statements = true
 csharp_space_after_semicolon_in_for_statement = true
 csharp_space_around_binary_operators = before_and_after
-csharp_space_around_declaration_statements = do_not_ignore
+csharp_space_around_declaration_statements = false
 csharp_space_before_colon_in_inheritance_clause = true
 csharp_space_before_comma = false
 csharp_space_before_dot = false
@@ -142,5 +160,5 @@ indent_size = 2
 [*.{cmd,ps1}]
 indent_size = 8
 
-[*.{yaml, yml}]
+[*.{yaml,yml}]
 indent_size = 2

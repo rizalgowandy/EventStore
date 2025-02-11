@@ -1,13 +1,12 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<TargetFramework>net5.0</TargetFramework>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-		<Platforms>x64</Platforms>
 	</PropertyGroup>
 	<ItemGroup>
 		<PackageReference Include="Mono.Posix.NETStandard" Version="1.0.0" />
-		<ProjectReference Include="..\EventStore.Common\EventStore.Common.csproj" />
+	</ItemGroup>
+	<ItemGroup>
+	  <ProjectReference Include="..\EventStore.SystemRuntime\EventStore.SystemRuntime.csproj" />
 	</ItemGroup>
 </Project>

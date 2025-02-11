@@ -1,6 +1,11 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using EventStore.Core.Bus;
 using EventStore.Core.Index;
 using EventStore.Core.Messages;
@@ -13,103 +18,101 @@ using EventStore.Core.TransactionLog.Chunks;
 using EventStore.Core.TransactionLog.LogRecords;
 using NUnit.Framework;
 
-namespace EventStore.Core.Tests.Services.IndexCommitter {
-	public abstract class with_index_committer_service<TLogFormat, TStreamId> {
-		protected int CommitCount = 2;
-		protected ITableIndex TableIndex;
+namespace EventStore.Core.Tests.Services.IndexCommitter;
 
-		protected ICheckpoint ReplicationCheckpoint;
-		protected ICheckpoint WriterCheckpoint;
-		protected InMemoryBus Publisher = new InMemoryBus("publisher");
-		protected ConcurrentQueue<StorageMessage.CommitIndexed> CommitReplicatedMgs = new ConcurrentQueue<StorageMessage.CommitIndexed>();
-		protected ConcurrentQueue<ReplicationTrackingMessage.IndexedTo> IndexWrittenMgs = new ConcurrentQueue<ReplicationTrackingMessage.IndexedTo>();
+public abstract class with_index_committer_service<TLogFormat, TStreamId> {
+	protected ITableIndex TableIndex;
 
-		protected IndexCommitterService<TStreamId> Service;
-		protected FakeIndexCommitter<TStreamId> IndexCommitter;
-		protected ITFChunkScavengerLogManager TfChunkScavengerLogManager;
-		
-		[OneTimeSetUp]
-		public virtual void TestFixtureSetUp() {
-			IndexCommitter = new FakeIndexCommitter<TStreamId>();
-			ReplicationCheckpoint = new InMemoryCheckpoint();
-			WriterCheckpoint = new InMemoryCheckpoint(0);
-			TableIndex = new FakeTableIndex<TStreamId>();
-			TfChunkScavengerLogManager = new FakeTfChunkLogManager();
-			Service = new IndexCommitterService<TStreamId>(IndexCommitter, Publisher, WriterCheckpoint, ReplicationCheckpoint, CommitCount, TableIndex, new QueueStatsManager());
-			Service.Init(0);
-			Publisher.Subscribe(new AdHocHandler<StorageMessage.CommitIndexed>(m => CommitReplicatedMgs.Enqueue(m)));
-			Publisher.Subscribe(new AdHocHandler<ReplicationTrackingMessage.IndexedTo>(m => IndexWrittenMgs.Enqueue(m)));
-			Publisher.Subscribe<ReplicationTrackingMessage.ReplicatedTo>(Service);
-			Given();
+	protected ICheckpoint ReplicationCheckpoint;
+	protected ICheckpoint WriterCheckpoint;
+	protected SynchronousScheduler Publisher = new("publisher");
+	protected ConcurrentQueue<StorageMessage.CommitIndexed> CommitReplicatedMgs = new ConcurrentQueue<StorageMessage.CommitIndexed>();
+	protected ConcurrentQueue<ReplicationTrackingMessage.IndexedTo> IndexWrittenMgs = new ConcurrentQueue<ReplicationTrackingMessage.IndexedTo>();
 
-			When();
-		}
+	protected IndexCommitterService<TStreamId> Service;
+	protected FakeIndexCommitter<TStreamId> IndexCommitter;
+	protected ITFChunkScavengerLogManager TfChunkScavengerLogManager;
 
-		[OneTimeTearDown]
-		public virtual void TestFixtureTearDown() {
-			Service.Stop();
-		}
-		public abstract void Given();
-		public abstract void When();
+	[OneTimeSetUp]
+	public virtual async Task TestFixtureSetUp() {
+		IndexCommitter = new FakeIndexCommitter<TStreamId>();
+		ReplicationCheckpoint = new InMemoryCheckpoint();
+		WriterCheckpoint = new InMemoryCheckpoint(0);
+		TableIndex = new FakeTableIndex<TStreamId>();
+		TfChunkScavengerLogManager = new FakeTfChunkLogManager();
+		Service = new IndexCommitterService<TStreamId>(IndexCommitter, Publisher, WriterCheckpoint, ReplicationCheckpoint, TableIndex, new QueueStatsManager());
+		await Service.Init(0, CancellationToken.None);
+		Publisher.Subscribe(new AdHocHandler<StorageMessage.CommitIndexed>(m => CommitReplicatedMgs.Enqueue(m)));
+		Publisher.Subscribe(new AdHocHandler<ReplicationTrackingMessage.IndexedTo>(m => IndexWrittenMgs.Enqueue(m)));
+		Publisher.Subscribe<ReplicationTrackingMessage.ReplicatedTo>(Service);
+		Given();
 
-		protected void AddPendingPrepare(long transactionPosition, long postPosition = -1) {
-			postPosition = postPosition == -1 ? transactionPosition : postPosition;
-			var prepare = CreatePrepare(transactionPosition, transactionPosition);
-			Service.AddPendingPrepare(new[] { prepare }, postPosition);
-		}
-
-		protected void AddPendingPrepares(long transactionPosition, long[] logPositions) {
-			var prepares = new List<IPrepareLogRecord<TStreamId>>();
-			foreach (var pos in logPositions) {
-				prepares.Add(CreatePrepare(transactionPosition, pos));
-			}
-
-			Service.AddPendingPrepare(prepares.ToArray(), logPositions[^1]);
-		}
-
-		private IPrepareLogRecord<TStreamId> CreatePrepare(long transactionPosition, long logPosition) {
-			var recordFactory = LogFormatHelper<TLogFormat, TStreamId>.RecordFactory;
-			var streamId = LogFormatHelper<TLogFormat, TStreamId>.StreamId;
-			var eventTypeId = LogFormatHelper<TLogFormat, TStreamId>.EventTypeId;
-			return LogRecord.Prepare(recordFactory, logPosition, Guid.NewGuid(), Guid.NewGuid(), transactionPosition, 0,
-				streamId, -1, PrepareFlags.None, eventTypeId,
-				new byte[10], new byte[0]);
-		}
-
-
-		protected void AddPendingCommit(long transactionPosition, long logPosition, long postPosition = -1) {
-			postPosition = postPosition == -1 ? logPosition : postPosition;
-			var commit = LogRecord.Commit(logPosition, Guid.NewGuid(), transactionPosition, 0);
-			Service.AddPendingCommit(commit, postPosition);
-		}
+		When();
 	}
 
-	public class FakeIndexCommitter<TStreamId> : IIndexCommitter<TStreamId> {
-		public ConcurrentQueue<IPrepareLogRecord<TStreamId>> CommittedPrepares = new ConcurrentQueue<IPrepareLogRecord<TStreamId>>();
-		public ConcurrentQueue<CommitLogRecord> CommittedCommits = new ConcurrentQueue<CommitLogRecord>();
-
-		public long LastIndexedPosition { get; set; }
-
-		public void Init(long buildToPosition) {
-		}
-
-		public void Dispose() {
-		}
-
-		public long Commit(CommitLogRecord commit, bool isTfEof, bool cacheLastEventNumber) {
-			CommittedCommits.Enqueue(commit);
-			return 0;
-		}
-
-		public long Commit(IList<IPrepareLogRecord<TStreamId>> committedPrepares, bool isTfEof, bool cacheLastEventNumber) {
-			foreach (var prepare in committedPrepares) {
-				CommittedPrepares.Enqueue(prepare);	
-			}
-			return 0;
-		}
-
-		public long GetCommitLastEventNumber(CommitLogRecord commit) {
-			return 0;
-		}
+	[OneTimeTearDown]
+	public virtual void TestFixtureTearDown() {
+		Service.Stop();
 	}
+	public abstract void Given();
+	public abstract void When();
+
+	protected void AddPendingPrepare(long transactionPosition, long postPosition = -1) {
+		postPosition = postPosition == -1 ? transactionPosition : postPosition;
+		var prepare = CreatePrepare(transactionPosition, transactionPosition);
+		Service.AddPendingPrepare(new[] { prepare }, postPosition);
+	}
+
+	protected void AddPendingPrepares(long transactionPosition, long[] logPositions) {
+		var prepares = new List<IPrepareLogRecord<TStreamId>>();
+		foreach (var pos in logPositions) {
+			prepares.Add(CreatePrepare(transactionPosition, pos));
+		}
+
+		Service.AddPendingPrepare(prepares.ToArray(), logPositions[^1]);
+	}
+
+	private IPrepareLogRecord<TStreamId> CreatePrepare(long transactionPosition, long logPosition) {
+		var recordFactory = LogFormatHelper<TLogFormat, TStreamId>.RecordFactory;
+		var streamId = LogFormatHelper<TLogFormat, TStreamId>.StreamId;
+		var eventTypeId = LogFormatHelper<TLogFormat, TStreamId>.EventTypeId;
+		return LogRecord.Prepare(recordFactory, logPosition, Guid.NewGuid(), Guid.NewGuid(), transactionPosition, 0,
+			streamId, -1, PrepareFlags.None, eventTypeId,
+			new byte[10], new byte[0]);
+	}
+
+
+	protected void AddPendingCommit(long transactionPosition, long logPosition, long postPosition = -1) {
+		postPosition = postPosition == -1 ? logPosition : postPosition;
+		var commit = LogRecord.Commit(logPosition, Guid.NewGuid(), transactionPosition, 0);
+		Service.AddPendingCommit(commit, postPosition);
+	}
+}
+
+public class FakeIndexCommitter<TStreamId> : IIndexCommitter<TStreamId> {
+	public ConcurrentQueue<IPrepareLogRecord<TStreamId>> CommittedPrepares = new();
+	public ConcurrentQueue<CommitLogRecord> CommittedCommits = new();
+
+	public long LastIndexedPosition { get; set; }
+
+	public ValueTask Init(long buildToPosition, CancellationToken token)
+		=> ValueTask.CompletedTask;
+
+	public void Dispose() {
+	}
+
+	public ValueTask<long> Commit(CommitLogRecord commit, bool isTfEof, bool cacheLastEventNumber, CancellationToken token) {
+		CommittedCommits.Enqueue(commit);
+		return new(0L);
+	}
+
+	public ValueTask<long> Commit(IReadOnlyList<IPrepareLogRecord<TStreamId>> committedPrepares, bool isTfEof, bool cacheLastEventNumber, CancellationToken token) {
+		foreach (var prepare in committedPrepares) {
+			CommittedPrepares.Enqueue(prepare);
+		}
+
+		return new(0L);
+	}
+
+	public ValueTask<long> GetCommitLastEventNumber(CommitLogRecord commit, CancellationToken token) => new(0L);
 }

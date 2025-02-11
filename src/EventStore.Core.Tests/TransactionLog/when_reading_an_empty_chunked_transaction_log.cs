@@ -1,4 +1,9 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using EventStore.Core.LogV2;
 using EventStore.Core.Tests.TransactionLog;
 using EventStore.Core.TransactionLog;
@@ -8,51 +13,46 @@ using EventStore.Core.TransactionLog.FileNamingStrategy;
 using EventStore.Core.TransactionLog.LogRecords;
 using NUnit.Framework;
 
-namespace EventStore.Core.Tests.TransactionLog {
-	[TestFixture(typeof(LogFormat.V2), typeof(string))]
-	[TestFixture(typeof(LogFormat.V3), typeof(uint))]
-	public class when_reading_an_empty_chunked_transaction_log<TLogFormat, TStreamId> : SpecificationWithDirectory {
-		[Test]
-		public void try_read_returns_false_when_writer_checksum_is_zero() {
-			var writerchk = new InMemoryCheckpoint(0);
-			var chaserchk = new InMemoryCheckpoint(0);
-			var db = new TFChunkDb(TFChunkHelper.CreateDbConfig(PathName, writerchk, chaserchk));
-			db.Open();
+namespace EventStore.Core.Tests.TransactionLog;
 
-			var reader = new TFChunkReader(db, writerchk, 0);
-			Assert.IsFalse(reader.TryReadNext().Success);
+[TestFixture(typeof(LogFormat.V2), typeof(string))]
+[TestFixture(typeof(LogFormat.V3), typeof(uint))]
+public class when_reading_an_empty_chunked_transaction_log<TLogFormat, TStreamId> : SpecificationWithDirectory {
+	[Test]
+	public async Task try_read_returns_false_when_writer_checksum_is_zero() {
+		var writerchk = new InMemoryCheckpoint(0);
+		var chaserchk = new InMemoryCheckpoint(0);
+		await using var db = new TFChunkDb(TFChunkHelper.CreateDbConfig(PathName, writerchk, chaserchk));
+		await db.Open();
 
-			db.Close();
-		}
+		var reader = new TFChunkReader(db, writerchk, 0);
+		Assert.IsTrue(await reader.TryReadNext(CancellationToken.None) is { Success: false });
+	}
 
-		[Test]
-		public void try_read_does_not_cache_anything_and_returns_record_once_it_is_written_later() {
-			var writerchk = new InMemoryCheckpoint(0);
-			var chaserchk = new InMemoryCheckpoint(0);
-			var db = new TFChunkDb(TFChunkHelper.CreateDbConfig(PathName, writerchk, chaserchk));
-			db.Open();
+	[Test]
+	public async Task try_read_does_not_cache_anything_and_returns_record_once_it_is_written_later() {
+		var writerchk = new InMemoryCheckpoint(0);
+		var chaserchk = new InMemoryCheckpoint(0);
+		await using var db = new TFChunkDb(TFChunkHelper.CreateDbConfig(PathName, writerchk, chaserchk));
+		await db.Open();
 
-			var writer = new TFChunkWriter(db);
-			writer.Open();
+		var writer = new TFChunkWriter(db);
+		writer.Open();
 
-			var reader = new TFChunkReader(db, writerchk, 0);
+		var reader = new TFChunkReader(db, writerchk, 0);
 
-			Assert.IsFalse(reader.TryReadNext().Success);
+		Assert.IsTrue(await reader.TryReadNext(CancellationToken.None) is { Success: false });
 
-			var recordFactory = LogFormatHelper<TLogFormat, TStreamId>.RecordFactory;
-			var streamId = LogFormatHelper<TLogFormat, TStreamId>.StreamId;
-			var eventTypeId = LogFormatHelper<TLogFormat, TStreamId>.EventTypeId;
-			var rec = LogRecord.SingleWrite(recordFactory, 0, Guid.NewGuid(), Guid.NewGuid(), streamId, -1, eventTypeId, new byte[] {7}, null);
-			long tmp;
-			Assert.IsTrue(writer.Write(rec, out tmp));
-			writer.Flush();
-			writer.Close();
+		var recordFactory = LogFormatHelper<TLogFormat, TStreamId>.RecordFactory;
+		var streamId = LogFormatHelper<TLogFormat, TStreamId>.StreamId;
+		var eventTypeId = LogFormatHelper<TLogFormat, TStreamId>.EventTypeId;
+		var rec = LogRecord.SingleWrite(recordFactory, 0, Guid.NewGuid(), Guid.NewGuid(), streamId, -1, eventTypeId, new byte[] {7}, null);
 
-			var res = reader.TryReadNext();
-			Assert.IsTrue(res.Success);
-			Assert.AreEqual(rec, res.LogRecord);
+		Assert.IsTrue(await writer.Write(rec, CancellationToken.None) is (true, _));
+		await writer.DisposeAsync();
 
-			db.Close();
-		}
+		var res = await reader.TryReadNext(CancellationToken.None);
+		Assert.IsTrue(res.Success);
+		Assert.AreEqual(rec, res.LogRecord);
 	}
 }

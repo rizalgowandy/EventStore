@@ -1,35 +1,38 @@
-﻿using EventStore.Projections.Core.Messages;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Projections.Core.Services.Management.ManagedProjectionStates {
-	internal abstract class ManagedProjectionStateBase {
-		protected readonly ManagedProjection _managedProjection;
+using EventStore.Projections.Core.Messages;
 
-		protected ManagedProjectionStateBase(ManagedProjection managedProjection) {
-			_managedProjection = managedProjection;
-		}
+namespace EventStore.Projections.Core.Services.Management.ManagedProjectionStates;
 
-		private void Unexpected(string message) {
-			_managedProjection.Fault(message + " in " + this.GetType().Name);
-		}
+internal abstract class ManagedProjectionStateBase {
+	protected readonly ManagedProjection _managedProjection;
 
-		protected void SetFaulted(string reason) {
-			_managedProjection.Fault(reason);
-		}
+	protected ManagedProjectionStateBase(ManagedProjection managedProjection) {
+		_managedProjection = managedProjection;
+	}
 
-		protected internal virtual void Started() {
-			Unexpected("Unexpected 'STARTED' message");
-		}
+	private void Unexpected(string message) {
+		_managedProjection.Fault(message + " in " + this.GetType().Name);
+	}
 
-		protected internal virtual void Stopped(CoreProjectionStatusMessage.Stopped message) {
-			Unexpected("Unexpected 'STOPPED' message");
-		}
+	protected void SetFaulted(string reason) {
+		_managedProjection.Fault(reason);
+	}
 
-		protected internal virtual void Faulted(CoreProjectionStatusMessage.Faulted message) {
-			Unexpected("Unexpected 'FAULTED' message");
-		}
+	protected internal virtual void Started() {
+		Unexpected("Unexpected 'STARTED' message");
+	}
 
-		protected internal virtual void Prepared(CoreProjectionStatusMessage.Prepared message) {
-			Unexpected("Unexpected 'PREPARED' message");
-		}
+	protected internal virtual void Stopped(CoreProjectionStatusMessage.Stopped message) {
+		Unexpected("Unexpected 'STOPPED' message");
+	}
+
+	protected internal virtual void Faulted(CoreProjectionStatusMessage.Faulted message) {
+		Unexpected("Unexpected 'FAULTED' message");
+	}
+
+	protected internal virtual void Prepared(CoreProjectionStatusMessage.Prepared message) {
+		Unexpected("Unexpected 'PREPARED' message");
 	}
 }

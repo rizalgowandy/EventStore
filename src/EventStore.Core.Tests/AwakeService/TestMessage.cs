@@ -1,18 +1,14 @@
-using System.Threading;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using EventStore.Core.Messaging;
 
-namespace EventStore.Core.Tests.AwakeService {
-	public class TestMessage : Message {
-		private static readonly int TypeId = Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Core.Tests.AwakeService;
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
+public class TestMessage : Message {
+	public readonly int Kind;
 
-		public readonly int Kind;
-
-		public TestMessage(int kind) {
-			Kind = kind;
-		}
+	public TestMessage(int kind) {
+		Kind = kind;
 	}
 }

@@ -1,3 +1,6 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -5,15 +8,20 @@ using EventStore.Core.Data;
 using EventStore.Core.Messages;
 using EventStore.Core.Messaging;
 using EventStore.Client.Streams;
+using EventStore.Core.Services.Transport.Common;
 using Grpc.Core;
 using Empty = EventStore.Client.Empty;
 
-namespace EventStore.Core.Services.Transport.Grpc {
-	internal partial class Streams<TStreamId> {
-		public override async Task<AppendResp> Append(
-			IAsyncStreamReader<AppendReq> requestStream,
-			ServerCallContext context) {
-			if (!await requestStream.MoveNext().ConfigureAwait(false))
+namespace EventStore.Core.Services.Transport.Grpc;
+
+internal partial class Streams<TStreamId> {
+	public override async Task<AppendResp> Append(
+		IAsyncStreamReader<AppendReq> requestStream,
+		ServerCallContext context) {
+
+		using var duration = _appendTracker.Start();
+		try {
+			if (!await requestStream.MoveNext())
 				throw new InvalidOperationException();
 
 			if (requestStream.Current.ContentCase != AppendReq.ContentOneofCase.Options)
@@ -38,7 +46,7 @@ namespace EventStore.Core.Services.Transport.Grpc {
 			var user = context.GetHttpContext().User;
 			var op = WriteOperation.WithParameter(
 				Plugins.Authorization.Operations.Streams.Parameters.StreamId(streamName));
-			if (!await _provider.CheckAccessAsync(user, op, context.CancellationToken).ConfigureAwait(false)) {
+			if (!await _provider.CheckAccessAsync(user, op, context.CancellationToken)) {
 				throw RpcExceptions.AccessDenied();
 			}
 
@@ -47,7 +55,7 @@ namespace EventStore.Core.Services.Transport.Grpc {
 			var events = new List<Event>();
 
 			var size = 0;
-			while (await requestStream.MoveNext().ConfigureAwait(false)) {
+			while (await requestStream.MoveNext()) {
 				if (requestStream.Current.ContentCase != AppendReq.ContentOneofCase.ProposedMessage)
 					throw new InvalidOperationException();
 
@@ -77,7 +85,7 @@ namespace EventStore.Core.Services.Transport.Grpc {
 					metadata));
 			}
 
-			var appendResponseSource = new TaskCompletionSource<AppendResp>();
+			var appendResponseSource = new TaskCompletionSource<AppendResp>(TaskCreationOptions.RunContinuationsAsynchronously);
 
 			var envelope = new CallbackEnvelope(HandleWriteEventsCompleted);
 
@@ -92,11 +100,11 @@ namespace EventStore.Core.Services.Transport.Grpc {
 				user,
 				cancellationToken: context.CancellationToken));
 
-			return await appendResponseSource.Task.ConfigureAwait(false);
+			return await appendResponseSource.Task;
 
 			void HandleWriteEventsCompleted(Message message) {
 				if (message is ClientMessage.NotHandled notHandled &&
-				    RpcExceptions.TryHandleNotHandled(notHandled, out var ex)) {
+					RpcExceptions.TryHandleNotHandled(notHandled, out var ex)) {
 					appendResponseSource.TrySetException(ex);
 					return;
 				}
@@ -184,6 +192,9 @@ namespace EventStore.Core.Services.Transport.Grpc {
 						return;
 				}
 			}
+		} catch (Exception ex) {
+			duration.SetException(ex);
+			throw;
 		}
 	}
 }

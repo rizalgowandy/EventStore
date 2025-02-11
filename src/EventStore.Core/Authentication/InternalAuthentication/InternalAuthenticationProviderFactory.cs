@@ -1,57 +1,62 @@
-﻿using EventStore.Core.Helpers;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using EventStore.Core.Helpers;
 using EventStore.Core.Messages;
-using EventStore.Core.Messaging;
 using EventStore.Core.Services.Transport.Http.Authentication;
 using EventStore.Core.Services.Transport.Http.Controllers;
 using EventStore.Core.Settings;
 using EventStore.Plugins.Authentication;
-using Serilog;
 
-namespace EventStore.Core.Authentication.InternalAuthentication {
-	public class InternalAuthenticationProviderFactory : IAuthenticationProviderFactory {
-		private readonly AuthenticationProviderFactoryComponents _components;
-		private readonly IODispatcher _dispatcher;
-		private readonly Rfc2898PasswordHashAlgorithm _passwordHashAlgorithm;
+namespace EventStore.Core.Authentication.InternalAuthentication;
 
-		public InternalAuthenticationProviderFactory(AuthenticationProviderFactoryComponents components) {
-			_components = components;
-			_passwordHashAlgorithm = new Rfc2898PasswordHashAlgorithm();
-			_dispatcher = new IODispatcher(components.MainQueue,
-				new PublishEnvelope(components.WorkersQueue, crossThread: true));
+public class InternalAuthenticationProviderFactory : IAuthenticationProviderFactory {
+	private readonly AuthenticationProviderFactoryComponents _components;
+	private readonly IODispatcher _dispatcher;
+	private readonly Rfc2898PasswordHashAlgorithm _passwordHashAlgorithm;
+	private readonly ClusterVNodeOptions.DefaultUserOptions _defaultUserOptions;
 
-			foreach (var bus in components.WorkerBuses) {
-				bus.Subscribe(_dispatcher.ForwardReader);
-				bus.Subscribe(_dispatcher.BackwardReader);
-				bus.Subscribe(_dispatcher.Writer);
-				bus.Subscribe(_dispatcher.StreamDeleter);
-				bus.Subscribe(_dispatcher.Awaker);
-				bus.Subscribe(_dispatcher);
-			}
+	public InternalAuthenticationProviderFactory(AuthenticationProviderFactoryComponents components, ClusterVNodeOptions.DefaultUserOptions defaultUserOptions) {
+		_components = components;
+		_passwordHashAlgorithm = new();
+		_dispatcher = new(components.MainQueue, components.WorkersQueue);
+		_defaultUserOptions = defaultUserOptions;
 
-			var usersController =
-				new UsersController(components.HttpSendService, components.MainQueue, components.WorkersQueue);
-			components.HttpService.SetupController(usersController);
+		foreach (var bus in components.WorkerBuses) {
+			bus.Subscribe<ClientMessage.ReadStreamEventsForwardCompleted>(_dispatcher.ForwardReader);
+			bus.Subscribe<ClientMessage.ReadStreamEventsBackwardCompleted>(_dispatcher.BackwardReader);
+			bus.Subscribe<ClientMessage.NotHandled>(_dispatcher.BackwardReader);
+			bus.Subscribe<ClientMessage.WriteEventsCompleted>(_dispatcher.Writer);
+			bus.Subscribe<ClientMessage.DeleteStreamCompleted>(_dispatcher.StreamDeleter);
+			bus.Subscribe<IODispatcherDelayedMessage>(_dispatcher.Awaker);
+			bus.Subscribe<IODispatcherDelayedMessage>(_dispatcher);
+			bus.Subscribe<ClientMessage.NotHandled>(_dispatcher);
 		}
 
-		public IAuthenticationProvider Build(bool logFailedAuthenticationAttempts, ILogger logger) {
-			var provider =
-				new InternalAuthenticationProvider(_components.MainBus, _dispatcher, _passwordHashAlgorithm, ESConsts.CachedPrincipalCount,
-					logFailedAuthenticationAttempts);
-			var passwordChangeNotificationReader =
-				new PasswordChangeNotificationReader(_components.MainQueue, _dispatcher);
-			_components.MainBus.Subscribe<SystemMessage.SystemStart>(passwordChangeNotificationReader);
-			_components.MainBus.Subscribe<SystemMessage.BecomeShutdown>(passwordChangeNotificationReader);
-			_components.MainBus.Subscribe(provider);
+		var usersController = new UsersController(
+			components.HttpSendService,
+			components.MainQueue,
+			components.WorkersQueue
+		);
 
-			var ioDispatcher = new IODispatcher(_components.MainQueue, new PublishEnvelope(_components.MainQueue));
-			_components.MainBus.Subscribe(ioDispatcher.BackwardReader);
-			_components.MainBus.Subscribe(ioDispatcher.ForwardReader);
-			_components.MainBus.Subscribe(ioDispatcher.Writer);
-			_components.MainBus.Subscribe(ioDispatcher.StreamDeleter);
-			_components.MainBus.Subscribe(ioDispatcher.Awaker);
-			_components.MainBus.Subscribe(ioDispatcher);
+		components.HttpService.SetupController(usersController);
+	}
 
-			return provider;
-		}
+	public IAuthenticationProvider Build(bool logFailedAuthenticationAttempts) {
+		var provider = new InternalAuthenticationProvider(
+			subscriber: _components.MainBus,
+			ioDispatcher: _dispatcher,
+			passwordHashAlgorithm: _passwordHashAlgorithm,
+			cacheSize: ESConsts.CachedPrincipalCount,
+			logFailedAuthenticationAttempts: logFailedAuthenticationAttempts,
+			defaultUserOptions: _defaultUserOptions
+		);
+
+		var passwordChangeNotificationReader = new PasswordChangeNotificationReader(_components.MainQueue, _dispatcher);
+		_components.MainBus.Subscribe<SystemMessage.SystemStart>(passwordChangeNotificationReader);
+		_components.MainBus.Subscribe<SystemMessage.BecomeShutdown>(passwordChangeNotificationReader);
+		_components.MainBus.Subscribe(provider);
+
+		return provider;
 	}
 }

@@ -2,7 +2,7 @@
 name: Bug report
 about: Create a report to help us improve
 title: ''
-labels: kind/bug
+labels: 'bug'
 assignees: ''
 
 ---
@@ -31,7 +31,7 @@ If applicable, please attach your node configuration, logs or any screenshots.
 
  - Operating system:
 
- - EventStore client version (if applicable):
+ - EventStore client library and version (if applicable):
 
 **Additional context**
 Add any other context about the problem here.

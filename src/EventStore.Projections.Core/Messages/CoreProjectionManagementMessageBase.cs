@@ -1,22 +1,20 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Projections.Core.Messages {
-	public abstract class CoreProjectionManagementMessageBase : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+namespace EventStore.Projections.Core.Messages;
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
+[DerivedMessage]
+public abstract partial class CoreProjectionManagementMessageBase : Message {
+	private readonly Guid _projectionIdId;
 
-		private readonly Guid _projectionIdId;
+	protected CoreProjectionManagementMessageBase(Guid projectionId) {
+		_projectionIdId = projectionId;
+	}
 
-		protected CoreProjectionManagementMessageBase(Guid projectionId) {
-			_projectionIdId = projectionId;
-		}
-
-		public Guid ProjectionId {
-			get { return _projectionIdId; }
-		}
+	public Guid ProjectionId {
+		get { return _projectionIdId; }
 	}
 }

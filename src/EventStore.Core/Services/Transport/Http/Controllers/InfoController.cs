@@ -1,8 +1,9 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Linq;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Reflection;
 using EventStore.Common.Utils;
 using EventStore.Transport.Http;
 using EventStore.Transport.Http.Codecs;
@@ -12,134 +13,109 @@ using EventStore.Core.Data;
 using EventStore.Core.Messages;
 using EventStore.Plugins.Authentication;
 using EventStore.Plugins.Authorization;
+using Newtonsoft.Json.Linq;
 using ILogger = Serilog.ILogger;
 
-namespace EventStore.Core.Services.Transport.Http.Controllers {
-	public class InfoController : IHttpController,
-		IHandle<SystemMessage.StateChangeMessage> {
-		private static readonly ILogger Log = Serilog.Log.ForContext<InfoController>();
-		private static readonly ICodec[] SupportedCodecs = {Codec.Json, Codec.Xml, Codec.ApplicationXml, Codec.Text};
+namespace EventStore.Core.Services.Transport.Http.Controllers;
 
-		private readonly ClusterVNodeOptions _options;
-		private readonly IDictionary<string, bool> _features;
-		private readonly IAuthenticationProvider _authenticationProvider;
-		private VNodeState _currentState;
+public class InfoController : IHttpController, IHandle<SystemMessage.StateChangeMessage> {
+	private static readonly ILogger Log = Serilog.Log.ForContext<InfoController>();
+	private static readonly ICodec[] SupportedCodecs = { Codec.Json, Codec.Xml, Codec.ApplicationXml, Codec.Text };
 
-		public InfoController(ClusterVNodeOptions options, IDictionary<string, bool> features, IAuthenticationProvider authenticationProvider) {
-			_options = options;
-			_features = features;
-			_authenticationProvider = authenticationProvider;
-		}
+	private readonly ClusterVNodeOptions _options;
+	private readonly IDictionary<string, bool> _features;
+	private readonly IAuthenticationProvider _authenticationProvider;
+	private VNodeState _currentState;
 
-		public void Subscribe(IHttpService service) {
-			Ensure.NotNull(service, "service");
-			service.RegisterAction(new ControllerAction("/info", HttpMethod.Get, Codec.NoCodecs, SupportedCodecs, new Operation(Operations.Node.Information.Read)),
-				OnGetInfo);
-			service.RegisterAction(
-				new ControllerAction("/info/options", HttpMethod.Get, Codec.NoCodecs, SupportedCodecs, new Operation(Operations.Node.Information.Options)), OnGetOptions);
-		}
+	public InfoController(ClusterVNodeOptions options, IDictionary<string, bool> features,
+		IAuthenticationProvider authenticationProvider) {
+		_options = options;
+		_features = features;
+		_authenticationProvider = authenticationProvider;
+	}
 
+	public void Subscribe(IHttpService service) {
+		Ensure.NotNull(service, "service");
 
-		public void Handle(SystemMessage.StateChangeMessage message) {
-			_currentState = message.State;
-		}
+		service.RegisterAction(
+			new("/info", HttpMethod.Get, Codec.NoCodecs, SupportedCodecs,
+				new Operation(Operations.Node.Information.Read)),
+			OnGetInfo);
+		service.RegisterAction(
+			new("/info/options", HttpMethod.Get, Codec.NoCodecs, SupportedCodecs,
+				new Operation(Operations.Node.Information.Options)),
+			OnGetOptions);
+	}
 
-		private void OnGetInfo(HttpEntityManager entity, UriTemplateMatch match) {
-			entity.ReplyTextContent(Codec.Json.To(new {
+	public void Handle(SystemMessage.StateChangeMessage message) =>
+		_currentState = message.State;
+
+	private void OnGetInfo(HttpEntityManager entity, UriTemplateMatch match) {
+		entity.ReplyTextContent(
+			Codec.Json.To(
+				new {
+					DBVersion = VersionInfo.Version,
 					ESVersion = VersionInfo.Version,
 					State = _currentState.ToString().ToLower(),
 					Features = _features,
 					Authentication = GetAuthenticationInfo()
-				}),
+				}
+			),
+			HttpStatusCode.OK,
+			"OK",
+			entity.ResponseCodec.ContentType,
+			null,
+			e => Log.Error(e, "Error while writing HTTP response (info)"));
+	}
+
+	private Dictionary<string, object> GetAuthenticationInfo() {
+		if (_authenticationProvider == null)
+			return null;
+
+		return new() {
+			{ "type", _authenticationProvider.Name },
+			{ "properties", _authenticationProvider.GetPublicProperties() }
+		};
+	}
+
+	private void OnGetOptions(HttpEntityManager entity, UriTemplateMatch match) {
+		if (entity.User != null && (entity.User.LegacyRoleCheck(SystemRoles.Operations) ||
+		                            entity.User.LegacyRoleCheck(SystemRoles.Admins))) {
+			var options = _options.LoadedOptions.Values.Select(
+				x => new OptionStructure {
+					Name = x.Metadata.Name,
+					Description = x.Metadata.Description,
+					Group = x.Metadata.SectionMetadata.SectionType.Name,
+					Value = x.DisplayValue,
+					ConfigurationSource = x.SourceDisplayName,
+					DeprecationMessage = x.Metadata.DeprecationMessage,
+					Schema = x.Metadata.OptionSchema
+				}
+			);
+
+			entity.ReplyTextContent(
+				Codec.Json.To(options),
 				HttpStatusCode.OK,
 				"OK",
 				entity.ResponseCodec.ContentType,
 				null,
-				e => Log.Error(e, "Error while writing HTTP response (info)"));
+				e => Log.Error(e, "error while writing HTTP response (options)")
+			);
+		} else {
+			entity.ReplyStatus(HttpStatusCode.Unauthorized, "Unauthorized", LogReplyError);
 		}
+	}
 
-		private Dictionary<string, object> GetAuthenticationInfo() {
-			if (_authenticationProvider == null)
-				return null;
+	private void LogReplyError(Exception exc) =>
+		Log.Debug("Error while replying (info controller): {e}.", exc.Message);
 
-			return new Dictionary<string, object>(){
-				{ "type", _authenticationProvider.Name },
-				{ "properties", _authenticationProvider.GetPublicProperties() }
-			};
-		}
-
-		private void OnGetOptions(HttpEntityManager entity, UriTemplateMatch match) {
-			if (entity.User != null && (entity.User.LegacyRoleCheck(SystemRoles.Operations) || entity.User.LegacyRoleCheck(SystemRoles.Admins))) {
-				entity.ReplyTextContent(Codec.Json.To(Filter(GetOptionsInfo(_options), new[] {"CertificatePassword"})),
-					HttpStatusCode.OK,
-					"OK",
-					entity.ResponseCodec.ContentType,
-					null,
-					e => Log.Error(e, "error while writing HTTP response (options)"));
-			} else {
-				entity.ReplyStatus(HttpStatusCode.Unauthorized, "Unauthorized", LogReplyError);
-			}
-		}
-
-		private void LogReplyError(Exception exc) {
-			Log.Debug("Error while replying (info controller): {e}.", exc.Message);
-		}
-
-		public class OptionStructure {
-			public string Name { get; set; }
-			public string Description { get; set; }
-			public string Group { get; set; }
-			public string Value { get; set; }
-			public string[] PossibleValues { get; set; }
-		}
-
-		public OptionStructure[] GetOptionsInfo(ClusterVNodeOptions options) {
-			var optionsToSendToClient = new List<OptionStructure>();
-			var optionGroups = typeof(ClusterVNodeOptions).GetProperties()
-				.Where(p => p.IsDefined(typeof(ClusterVNodeOptions.OptionGroupAttribute)));
-			foreach (PropertyInfo sectionInfo in optionGroups) {
-				var section = sectionInfo.GetValue(options, null);
-				foreach (PropertyInfo property in sectionInfo.PropertyType.GetProperties()) {
-					var argumentDescriptionAttribute = property.GetCustomAttribute<DescriptionAttribute>();
-					var configFileOptionValue = property.GetValue(section, null);
-					string[] possibleValues = null;
-					if (property.PropertyType.IsEnum) {
-						possibleValues = property.PropertyType.GetEnumNames();
-					} else if (property.PropertyType.IsArray) {
-						var array = configFileOptionValue as Array;
-						if (array == null) continue;
-						var configFileOptionValueAsString = String.Empty;
-						for (var i = 0; i < array.Length; i++) {
-							configFileOptionValueAsString += array.GetValue(i).ToString();
-						}
-
-						configFileOptionValue = configFileOptionValueAsString;
-					}
-
-					optionsToSendToClient.Add(new OptionStructure {
-						Name = property.Name,
-						Description = argumentDescriptionAttribute == null ? "" : argumentDescriptionAttribute.Description,
-						Group = property.DeclaringType?.GetCustomAttribute<DescriptionAttribute>()?.Description,
-						Value = configFileOptionValue == null ? "" : configFileOptionValue.ToString(),
-						PossibleValues = possibleValues
-					});
-				}
-			}
-
-			return optionsToSendToClient.ToArray();
-		}
-
-		public OptionStructure[] Filter(OptionStructure[] optionsToBeFiltered, params string[] namesOfValuesToExclude) {
-			return optionsToBeFiltered.Select(x =>
-				new OptionStructure {
-					Name = x.Name,
-					Description = x.Description,
-					Group = x.Group,
-					PossibleValues = x.PossibleValues,
-					Value = namesOfValuesToExclude.Contains(y => y.Equals(x.Name, StringComparison.OrdinalIgnoreCase))
-						? String.Empty
-						: x.Value
-				}).ToArray();
-		}
+	public class OptionStructure {
+		public string Name { get; set; }
+		public string Description { get; set; }
+		public string Group { get; set; }
+		public string Value { get; set; }
+		public string ConfigurationSource { get; set; }
+		public string DeprecationMessage { get; set; }
+		public JObject Schema { get; set; }
 	}
 }

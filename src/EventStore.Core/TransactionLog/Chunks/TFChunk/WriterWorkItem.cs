@@ -1,90 +1,97 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.IO;
 using System.Security.Cryptography;
-using EventStore.Common.Utils;
+using System.Threading;
+using System.Threading.Tasks;
+using DotNext;
+using DotNext.IO;
+using EventStore.Plugins.Transforms;
 
-namespace EventStore.Core.TransactionLog.Chunks.TFChunk {
-	internal class WriterWorkItem {
-		public Stream WorkingStream {
-			get { return _workingStream; }
-		}
+namespace EventStore.Core.TransactionLog.Chunks.TFChunk;
 
-		public long StreamLength {
-			get { return _workingStream.Length; }
-		}
+// see CancellationToken comment at the top of TFChunk.cs
+internal sealed class WriterWorkItem : Disposable {
+	public const int BufferSize = 8192;
 
-		public long StreamPosition {
-			get { return _workingStream.Position; }
-		}
+	public Stream WorkingStream { get; private set; }
 
-		private readonly Stream _fileStream;
-		private UnmanagedMemoryStream _memStream;
-		private Stream _workingStream;
+	private readonly ChunkDataWriteStream _fileStream;
+	private Stream _memStream;
+	public readonly IncrementalHash MD5;
 
-		public readonly MemoryStream Buffer;
-		public readonly BinaryWriter BufferWriter;
-		public readonly MD5 MD5;
+	public unsafe WriterWorkItem(nint memoryPtr, int length, IncrementalHash md5,
+		IChunkWriteTransform chunkWriteTransform, int initialStreamPosition) {
+		var memStream = new UnmanagedMemoryStream((byte*)memoryPtr, length, length, FileAccess.ReadWrite) {
+			Position = initialStreamPosition,
+		};
 
-		public WriterWorkItem(Stream fileStream, UnmanagedMemoryStream memStream, MD5 md5) {
-			_fileStream = fileStream;
-			_memStream = memStream;
-			_workingStream = (Stream)fileStream ?? memStream;
-			Buffer = new MemoryStream(8192);
-			BufferWriter = new BinaryWriter(Buffer);
-			MD5 = md5;
-		}
+		var chunkDataWriteStream = new ChunkDataWriteStream(memStream, md5);
+		WorkingStream = _memStream = chunkWriteTransform.TransformData(chunkDataWriteStream);
+		MD5 = md5;
+	}
 
-		public void SetMemStream(UnmanagedMemoryStream memStream) {
-			_memStream = memStream;
-			if (_fileStream == null)
-				_workingStream = memStream;
-		}
+	public WriterWorkItem(IChunkHandle handle, IncrementalHash md5, bool unbuffered,
+		IChunkWriteTransform chunkWriteTransform, int initialStreamPosition) {
+		var chunkStream = handle.CreateStream();
+		var fileStream = unbuffered
+			? chunkStream
+			: new PoolingBufferedStream(chunkStream) { MaxBufferSize = BufferSize };
+		fileStream.Position = initialStreamPosition;
+		var chunkDataWriteStream = new ChunkDataWriteStream(fileStream, md5);
 
-		public void AppendData(byte[] buf, int offset, int len) {
-			// as we are always append-only, stream's position should be right here
-			if (_fileStream != null)
-				_fileStream.Write(buf, 0, len);
-			//MEMORY
-			var memStream = _memStream;
-			if (memStream != null)
-				memStream.Write(buf, 0, len);
-		}
+		WorkingStream = _fileStream = chunkWriteTransform.TransformData(chunkDataWriteStream);
+		MD5 = md5;
+	}
 
-		public void ResizeStream(int fileSize) {
-			if (_fileStream != null)
-				_fileStream.SetLength(fileSize);
-			var memStream = _memStream;
-			if (memStream != null)
-				memStream.SetLength(fileSize);
-		}
+	public void SetMemStream(UnmanagedMemoryStream memStream) {
+		_memStream = memStream;
+		if (_fileStream is null)
+			WorkingStream = memStream;
+	}
 
-		public void Dispose() {
-			if (_fileStream != null)
-				_fileStream.Dispose();
+	// this method can throw, and if it does the two streams may be out of sync with each other
+	// at the moment callers need to realise this and not use this object any more.
+	// we don't pass the CancellationToken to WriteAsync because cancelling there would
+	// also leave this object in an invalid state.
+	public ValueTask AppendData(ReadOnlyMemory<byte> buf, CancellationToken _) {
+		// MEMORY (in-memory write doesn't require async I/O)
+		_memStream?.Write(buf.Span);
 
+		// as we are always append-only, stream's position should be right here
+		return _fileStream?.WriteAsync(buf, CancellationToken.None) ?? ValueTask.CompletedTask;
+	}
+
+	public void ResizeFileStream(long fileSize) {
+		_fileStream?.SetLength(fileSize);
+	}
+
+	protected override void Dispose(bool disposing) {
+		if (disposing) {
+			_fileStream?.Dispose();
 			DisposeMemStream();
+			MD5.Dispose();
 		}
 
-		public void FlushToDisk() {
-			if (_fileStream == null) return;
-			var fs = _fileStream as FileStream;
-			if (fs != null)
-				fs.FlushToDisk(); //because of broken flush in filestream in 3.5
-			else {
-				_fileStream.Flush();
-			}
-		}
+		base.Dispose(disposing);
+	}
 
-		public void DisposeMemStream() {
-			var memStream = _memStream;
-			if (memStream != null) {
-				memStream.Dispose();
-				_memStream = null;
-			}
-		}
+	public ValueTask FlushToDisk(CancellationToken token) {
+		// in-mem stream doesn't require async call
+		_memStream?.Flush();
 
-		public void EnsureMemStreamLength(long length) {
-			throw new NotSupportedException("Scavenging with in-mem DB is not supported.");
-		}
+		return new(_fileStream is not null ? _fileStream.FlushAsync(token) : Task.CompletedTask);
+	}
+
+	public void FlushToDisk() {
+		_fileStream?.Flush();
+		_memStream?.Flush();
+	}
+
+	public void DisposeMemStream() {
+		_memStream?.Dispose();
+		_memStream = null;
 	}
 }

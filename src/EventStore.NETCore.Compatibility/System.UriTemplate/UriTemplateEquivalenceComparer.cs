@@ -1,11 +1,12 @@
+#pragma warning disable IDE0073 // The file header does not match the required text
 //----------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //----------------------------------------------------------------
 
 #pragma warning disable 1634, 1691 // Stops compiler from warning about unknown warnings (for Presharp)
 
-namespace System
-{
+namespace System;
+
     using System.Collections.Generic;
     using System.ServiceModel;
     using System.Runtime.CompilerServices;
@@ -54,4 +55,3 @@ namespace System
 #pragma warning restore 56506
         }
     }
-}

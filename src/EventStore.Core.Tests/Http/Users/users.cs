@@ -1,20 +1,19 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
-using EventStore.Core.Services;
-using EventStore.Core.Services.Transport.Http.Controllers;
 using EventStore.Core.Tests.Helpers;
 using NUnit.Framework;
 using Newtonsoft.Json.Linq;
 
 namespace EventStore.Core.Tests.Http.Users {
 	namespace users {
+		public abstract class with_admin_user : with_admin_user<LogFormat.V2, string>;
+
 		public abstract class with_admin_user<TLogFormat, TStreamId> : HttpBehaviorSpecification<TLogFormat, TStreamId> {
 			protected readonly NetworkCredential _admin = DefaultData.AdminNetworkCredentials;
-
-			protected override bool GivenSkipInitializeStandardUsersCheck() {
-				return false;
-			}
 
 			public with_admin_user() {
 				SetDefaultCredentials(_admin);

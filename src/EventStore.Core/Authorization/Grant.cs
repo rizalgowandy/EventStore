@@ -1,7 +1,10 @@
-﻿namespace EventStore.Core.Authorization {
-	public enum Grant {
-		Unknown = 0,
-		Allow = 1,
-		Deny = 2
-	}
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+namespace EventStore.Core.Authorization;
+
+public enum Grant {
+	Unknown = 0,
+	Allow = 1,
+	Deny = 2
 }

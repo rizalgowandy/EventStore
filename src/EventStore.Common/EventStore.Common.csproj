@@ -1,40 +1,49 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<TargetFramework>net5.0</TargetFramework>
 		<GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-		<Platforms>x64</Platforms>
+		<GitVersion>false</GitVersion>
 	</PropertyGroup>
 	<ItemGroup>
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
 	</ItemGroup>
 	<ItemGroup>
-		<PackageReference Include="ConfigureAwaitChecker.Analyzer" Version="4.0.0">
-			<PrivateAssets>all</PrivateAssets>
-			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-		</PackageReference>
-		<PackageReference Include="GitInfo" Version="2.0.26">
+		<PackageReference Include="GitInfo" Version="3.3.3">
 			<PrivateAssets>all</PrivateAssets>
 			<IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
 		</PackageReference>
-		<PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="3.1.5" />
-		<PackageReference Include="Microsoft.Extensions.FileProviders.Composite" Version="3.1.5" />
-		<PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" Version="3.1.5" />
-		<PackageReference Include="Newtonsoft.Json" Version="11.0.2" />
-		<PackageReference Include="Serilog" Version="2.10.0" />
-		<PackageReference Include="Serilog.Enrichers.Process" Version="2.0.1" />
-		<PackageReference Include="Serilog.Enrichers.Thread" Version="3.1.0" />
-		<PackageReference Include="Serilog.Expressions" Version="3.2.0" />
-		<PackageReference Include="Serilog.Filters.Expressions" Version="2.1.0" />
-		<PackageReference Include="Serilog.Settings.Configuration" Version="3.1.0" />
-		<PackageReference Include="Serilog.Sinks.Async" Version="1.4.0" />
-		<PackageReference Include="Serilog.Sinks.Console" Version="3.1.1" />
-		<PackageReference Include="Serilog.Sinks.File" Version="4.1.0" />
-		<PackageReference Include="Serilog.Extensions.Logging" Version="3.0.1" />
-		<PackageReference Include="YamlDotnet" Version="5.2.1" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+		<PackageReference Include="Microsoft.Extensions.FileProviders.Composite" Version="8.0.0" />
+		<PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" Version="8.0.0" />
+		<PackageReference Include="NetEscapades.Configuration.Yaml" Version="3.1.0" />
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+		<PackageReference Include="Serilog" Version="4.0.1" />
+		<PackageReference Include="Serilog.Enrichers.Process" Version="3.0.0" />
+		<PackageReference Include="Serilog.Enrichers.Thread" Version="4.0.0" />
+		<PackageReference Include="Serilog.Expressions" Version="5.0.0" />
+		<PackageReference Include="Serilog.Extensions.Logging" Version="8.0.0" />
+		<PackageReference Include="Serilog.Settings.Configuration" Version="8.0.2" />
+		<PackageReference Include="Serilog.Sinks.Async" Version="2.0.0" />
+		<PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+		<PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+
+		<PackageReference Include="System.Security.Cryptography.Pkcs" Version="8.0.0" />
+		<PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+		<PackageReference Include="YamlDotnet" Version="13.7.1" />
+		<!-- upgrade because of transitive dependency vulnerability https://github.com/advisories/GHSA-8g4q-xg66-9fp4 -->
+		<PackageReference Include="System.Text.Json" Version="8.0.5" />
+		<!-- upgrade because of transitive dependency vulnerability https://github.com/advisories/GHSA-447r-wph3-92pm -->
+		<PackageReference Include="System.Formats.Asn1" Version="8.0.1" />
+		<!-- upgrade because of transitive dependency vulnerability https://github.com/advisories/GHSA-5f2m-466j-3848 and https://github.com/advisories/GHSA-xhfc-gr8f-ffwc -->
+		<PackageReference Include="System.Private.Uri" Version="4.3.2" />
 	</ItemGroup>
 	<ItemGroup>
-		<ProjectReference Include="..\EventStore.Common.Utils\EventStore.Common.Utils.csproj" />
+	  <None Update="Utils\version.properties">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
+	</ItemGroup>
+	<ItemGroup>
+	  <ProjectReference Include="..\EventStore.SystemRuntime\EventStore.SystemRuntime.csproj" />
 	</ItemGroup>
 
 </Project>

@@ -1,4 +1,7 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using EventStore.Core.Data;
@@ -8,6 +11,7 @@ using EventStore.Core.Tests;
 using EventStore.Projections.Core.Messages;
 using EventStore.Projections.Core.Messages.EventReaders.Feeds;
 using EventStore.Projections.Core.Services.Processing;
+using EventStore.Projections.Core.Services.Processing.Checkpointing;
 using NUnit.Framework;
 
 namespace EventStore.Projections.Core.Tests.Services.feed_reader {
@@ -53,7 +57,7 @@ namespace EventStore.Projections.Core.Tests.Services.feed_reader {
 			protected override IEnumerable<WhenStep> When() {
 				yield return
 					new FeedReaderMessage.ReadPage(
-						Guid.NewGuid(), new PublishEnvelope(GetInputQueue()), SystemAccounts.System,
+						Guid.NewGuid(), GetInputQueue(), SystemAccounts.System,
 						_querySourcesDefinition, _fromPosition, _maxEvents);
 			}
 
@@ -110,7 +114,7 @@ namespace EventStore.Projections.Core.Tests.Services.feed_reader {
 			protected override IEnumerable<WhenStep> When() {
 				yield return
 					new FeedReaderMessage.ReadPage(
-						Guid.NewGuid(), new PublishEnvelope(GetInputQueue()), SystemAccounts.System,
+						Guid.NewGuid(), GetInputQueue(), SystemAccounts.System,
 						_querySourcesDefinition, _fromPosition, _maxEvents);
 			}
 

@@ -1,76 +1,56 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using EventStore.Common.Utils;
 using EventStore.Core.Messaging;
 
-namespace EventStore.Core.Messages {
-	public static class ReplicationTrackingMessage {
-		public class WriterCheckpointFlushed : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
+namespace EventStore.Core.Messages;
+
+public static partial class ReplicationTrackingMessage {
+	[DerivedMessage(CoreMessage.ReplicationTracking)]
+	public partial class WriterCheckpointFlushed : Message {
+	}
+
+	[DerivedMessage(CoreMessage.ReplicationTracking)]
+	public partial class IndexedTo : Message {
+		public readonly long LogPosition;
+		
+		public IndexedTo(long logPosition ) {
+			Ensure.Nonnegative(logPosition + 1, "logPosition");
+			LogPosition = logPosition;
 		}
+	}
 
-		public class IndexedTo : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public readonly long LogPosition;
-			
-			public IndexedTo(long logPosition ) {
-				Ensure.Nonnegative(logPosition + 1, "logPosition");
-				LogPosition = logPosition;
-			}
+	[DerivedMessage(CoreMessage.ReplicationTracking)]
+	public partial class ReplicatedTo : Message {
+		public readonly long LogPosition;
+		
+		public ReplicatedTo(long logPosition ) {
+			Ensure.Nonnegative(logPosition + 1, "logPosition");
+			LogPosition = logPosition;
 		}
+	}
 
-		public class ReplicatedTo : Message { 
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public readonly long LogPosition;
-			
-			public ReplicatedTo(long logPosition ) {
-				Ensure.Nonnegative(logPosition + 1, "logPosition");
-				LogPosition = logPosition;
-			}
+	[DerivedMessage(CoreMessage.ReplicationTracking)]
+	public partial class LeaderReplicatedTo : Message {
+		public readonly long LogPosition;
+		
+		public LeaderReplicatedTo(long logPosition ) {
+			Ensure.Nonnegative(logPosition + 1, "logPosition");
+			LogPosition = logPosition;
 		}
+	}
 
-		public class LeaderReplicatedTo : Message { 
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+	[DerivedMessage(CoreMessage.ReplicationTracking)]
+	public partial class ReplicaWriteAck : Message {
+		public readonly Guid SubscriptionId;
+		public readonly long ReplicationLogPosition;
 
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-			
-			public readonly long LogPosition;
-			
-			public LeaderReplicatedTo(long logPosition ) {
-				Ensure.Nonnegative(logPosition + 1, "logPosition");
-				LogPosition = logPosition;
-			}
-		}
-
-		public class ReplicaWriteAck : Message {
-			private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-			public override int MsgTypeId {
-				get { return TypeId; }
-			}
-
-			public readonly Guid SubscriptionId;
-			public readonly long ReplicationLogPosition;
-
-			public ReplicaWriteAck(Guid subscriptionId, long replicationLogPosition) {
-				Ensure.NotEmptyGuid(subscriptionId, "subscriptionId");
-				SubscriptionId = subscriptionId;
-				ReplicationLogPosition = replicationLogPosition;
-			}
+		public ReplicaWriteAck(Guid subscriptionId, long replicationLogPosition) {
+			Ensure.NotEmptyGuid(subscriptionId, "subscriptionId");
+			SubscriptionId = subscriptionId;
+			ReplicationLogPosition = replicationLogPosition;
 		}
 	}
 }

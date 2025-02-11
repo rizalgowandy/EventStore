@@ -1,10 +1,14 @@
-﻿using System;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
+using System;
 using System.Text;
 using System.Threading.Tasks;
 using EventStore.ClientAPI;
 using EventStore.Core.Bus;
 using EventStore.Core.Tests;
 using EventStore.Projections.Core.Services.Processing;
+using EventStore.Projections.Core.Services.Processing.Checkpointing;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 
@@ -21,7 +25,7 @@ namespace EventStore.Projections.Core.Tests.ClientAPI {
 
 			[Test, Category("Network")]
 			public async Task deleted_stream_events_are_indexed() {
-				await Task.Delay(500).ConfigureAwait(false); //give the projection time to catchup...
+				await Task.Delay(500); //give the projection time to catchup...
 				var slice = await _conn.ReadStreamEventsForwardAsync("$ce-cat", 0, 10, true, _admin);
 				Assert.AreEqual(SliceReadStatus.Success, slice.Status);
 

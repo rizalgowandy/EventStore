@@ -1,65 +1,32 @@
-﻿using EventStore.Core.Messaging;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Tests.Bus.Helpers {
-	public class TestMessage : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+using EventStore.Core.Messaging;
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
+namespace EventStore.Core.Tests.Bus.Helpers;
 
-	public class TestMessage2 : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+public class TestMessage : Message {
+}
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
+public class TestMessage2 : Message {
+}
 
-	public class TestMessage3 : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+public class TestMessage3 : Message {
+}
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
+public class ParentTestMessage : Message {
+}
 
-	public class ParentTestMessage : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+public class ChildTestMessage : ParentTestMessage {
+}
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
+public class GrandChildTestMessage : ChildTestMessage {
+}
 
-	public class ChildTestMessage : ParentTestMessage {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
+public class TestMessageWithId : Message {
+	public readonly int Id;
 
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
-
-	public class GrandChildTestMessage : ChildTestMessage {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-	}
-
-	public class TestMessageWithId : Message {
-		private static readonly int TypeId = System.Threading.Interlocked.Increment(ref NextMsgId);
-
-		public override int MsgTypeId {
-			get { return TypeId; }
-		}
-
-		public int Id;
-
-		public TestMessageWithId(int id) {
-			Id = id;
-		}
+	public TestMessageWithId(int id) {
+		Id = id;
 	}
 }

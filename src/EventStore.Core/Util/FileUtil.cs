@@ -1,30 +1,33 @@
-﻿using System.IO;
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
-namespace EventStore.Core.Util {
-	public static class FileUtils {
-		public static void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs) {
-			// Get the subdirectories for the specified directory.
-			var dir = new DirectoryInfo(sourceDirName);
+using System.IO;
 
-			if (!dir.Exists)
-				throw new DirectoryNotFoundException("Source directory does not exist or could not be found: " +
-				                                     sourceDirName);
+namespace EventStore.Core.Util;
 
-			var subdirs = copySubDirs ? dir.GetDirectories() : null;
+public static class FileUtils {
+	public static void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs) {
+		// Get the subdirectories for the specified directory.
+		var dir = new DirectoryInfo(sourceDirName);
 
-			// If the destination directory doesn't exist, create it. 
-			if (!Directory.Exists(destDirName))
-				Directory.CreateDirectory(destDirName);
+		if (!dir.Exists)
+			throw new DirectoryNotFoundException("Source directory does not exist or could not be found: " +
+			                                     sourceDirName);
 
-			// Get the files in the directory and copy them to the new location.
-			foreach (FileInfo file in dir.GetFiles()) {
-				file.CopyTo(Path.Combine(destDirName, file.Name), false);
-			}
+		var subdirs = copySubDirs ? dir.GetDirectories() : null;
 
-			if (copySubDirs) {
-				foreach (DirectoryInfo subdir in subdirs) {
-					DirectoryCopy(subdir.FullName, Path.Combine(destDirName, subdir.Name), true);
-				}
+		// If the destination directory doesn't exist, create it. 
+		if (!Directory.Exists(destDirName))
+			Directory.CreateDirectory(destDirName);
+
+		// Get the files in the directory and copy them to the new location.
+		foreach (FileInfo file in dir.GetFiles()) {
+			file.CopyTo(Path.Combine(destDirName, file.Name), false);
+		}
+
+		if (copySubDirs) {
+			foreach (DirectoryInfo subdir in subdirs) {
+				DirectoryCopy(subdir.FullName, Path.Combine(destDirName, subdir.Name), true);
 			}
 		}
 	}

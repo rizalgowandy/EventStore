@@ -1,41 +1,46 @@
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
+
 using System;
 using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
 using EventStore.Core.LogAbstraction;
 using StreamId = System.UInt32;
 
-namespace EventStore.Core.LogV3 {
-	public class NameIndexInMemoryPersistence :
-		INameIndexPersistence<StreamId> {
+namespace EventStore.Core.LogV3;
 
-		readonly ConcurrentDictionary<string, StreamId> _dict = new();
+public class NameIndexInMemoryPersistence :
+	INameIndexPersistence<StreamId> {
 
-		public StreamId LastValueAdded { get; private set; }
+	readonly ConcurrentDictionary<string, StreamId> _dict = new();
 
-		public NameIndexInMemoryPersistence() {
-		}
+	public StreamId LastValueAdded { get; private set; }
 
-		public void Dispose() {
-		}
+	public NameIndexInMemoryPersistence() {
+	}
 
-		public void Init(INameLookup<StreamId> source) {
-		}
+	public void Dispose() {
+	}
 
-		public void Add(string name, StreamId value) {
-			_dict[name] = value;
-			LastValueAdded = value;
-		}
+	public ValueTask Init(INameLookup<StreamId> source, CancellationToken token)
+		=> token.IsCancellationRequested ? ValueTask.FromCanceled(token) : ValueTask.CompletedTask;
 
-		public bool TryGetValue(string name, out StreamId value) =>
-			_dict.TryGetValue(name, out value);
+	public void Add(string name, StreamId value) {
+		_dict[name] = value;
+		LastValueAdded = value;
+	}
 
-		public StreamId LookupValue(string name) {
-			if (string.IsNullOrEmpty(name))
-				throw new ArgumentNullException(nameof(name));
+	public bool TryGetValue(string name, out StreamId value) =>
+		_dict.TryGetValue(name, out value);
 
-			if (!_dict.TryGetValue(name, out var value))
-				return 0;
+	public StreamId LookupValue(string name) {
+		if (string.IsNullOrEmpty(name))
+			throw new ArgumentNullException(nameof(name));
 
-			return value;
-		}
+		if (!_dict.TryGetValue(name, out var value))
+			return 0;
+
+		return value;
 	}
 }

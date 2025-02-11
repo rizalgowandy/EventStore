@@ -1,626 +1,778 @@
-#pragma warning disable 420
+// Copyright (c) Kurrent, Inc and/or licensed to Kurrent, Inc under one or more agreements.
+// Kurrent, Inc licenses this file to you under the Kurrent License v1 (see LICENSE.md).
 
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Threading;
+using System.Threading.Tasks;
+using DotNext.Buffers;
+using DotNext.Collections.Concurrent;
+using DotNext.Diagnostics;
+using DotNext.IO;
+using DotNext.Threading;
 using EventStore.Common.Utils;
+using EventStore.Core.Data;
 using EventStore.Core.Exceptions;
-using EventStore.Core.Settings;
 using EventStore.Core.TransactionLog.LogRecords;
+using EventStore.Core.TransactionLog.Scavenging.DbAccess;
+using EventStore.Core.Transforms;
+using EventStore.Core.Transforms.Identity;
 using EventStore.Core.Util;
-using System.Collections.Concurrent;
-using EventStore.Core.TransactionLog.Unbuffered;
+using EventStore.Plugins.Transforms;
+using static System.Threading.Timeout;
 using ILogger = Serilog.ILogger;
 
+namespace EventStore.Core.TransactionLog.Chunks.TFChunk;
 
-namespace EventStore.Core.TransactionLog.Chunks.TFChunk {
-	public unsafe partial class TFChunk : IDisposable {
-		public enum ChunkVersions : byte {
-			OriginalNotUsed = 1,
-			Unaligned = 2,
-			Aligned = 3
+// Exception handling strategy on write: we generally do not attempt to recover from exceptions on write,
+// and instead leave the objects in an invalid state. The intention is that these should only be thrown
+// in catastrophic scenarios such as disk failure. The originator of the call takes suitable action:
+// typically shutdown the server (e.g. StorageWriter) or abandoning the chunk (e.g. Scavenge).
+//
+// If a CancellationToken we are passed is cancelled, we follow the normal practice and are allowed to
+// throw, but not if it would leave the object in an invalid state. It is up to the caller to not cancel
+// the call if doing so would cause the caller to shutdown the server.
+public partial class TFChunk : IChunkBlob {
+	public enum ChunkVersions : byte {
+		OriginalNotUsed = 1,
+		Unaligned = 2,
+		Aligned = 3,
+		Transformed = 4,
+	}
+
+	public const byte CurrentChunkVersion = (byte) ChunkVersions.Transformed;
+	private const int AlignmentSize = 4096;
+
+	private static readonly ILogger Log = Serilog.Log.ForContext<TFChunk>();
+
+	public bool IsReadOnly {
+		get { return Interlocked.CompareExchange(ref _isReadOnly, 0, 0) == 1; }
+		set { Interlocked.Exchange(ref _isReadOnly, value ? 1 : 0); }
+	}
+
+	public bool IsCached {
+		get { return _cacheStatus is CacheStatus.Cached; }
+	}
+
+	public bool IsRemote { get; }
+
+	// the logical size of (untransformed) data (could be > PhysicalDataSize if scavenged chunk)
+	public long LogicalDataSize {
+		get { return Interlocked.Read(ref _logicalDataSize); }
+	}
+
+	// the physical size of (untransformed) data
+	public int PhysicalDataSize {
+		get { return _physicalDataSize; }
+	}
+
+	// This can be used to locate the chunk regardless of whether it is local or remote.
+	// The FileSystem abstraction can understand it, and so can the user.
+	public string ChunkLocator => _filename;
+
+	// This can only be used when we know that the chunk is local.
+	// Generally ideally only the FileSystem abstraction should know whether the chunk is local or remote,
+	// so we want to minimise calls this this as we go, calling the FileSystem instead.
+	public string LocalFileName => _filename;
+
+	public int FileSize {
+		get { return _fileSize; }
+	}
+
+	public ChunkHeader ChunkHeader {
+		get { return _chunkHeader; }
+	}
+
+	public ChunkFooter ChunkFooter {
+		get { return _chunkFooter; }
+	}
+
+	public ChunkInfo ChunkInfo {
+		get => new() {
+			ChunkEndNumber = _chunkHeader.ChunkEndNumber,
+			ChunkEndPosition = _chunkHeader.ChunkEndPosition,
+			IsRemote = IsRemote,
+		};
+	}
+
+	public ReadOnlyMemory<byte> TransformHeader {
+		get { return _transformHeader; }
+	}
+
+	private readonly int _midpointsDepth;
+
+	public int RawWriterPosition {
+		get {
+			return (int)(_writerWorkItem?.WorkingStream.Position
+				?? throw new InvalidOperationException(string.Format("TFChunk {0} is not in write mode.", ChunkLocator)));
+		}
+	}
+
+	private readonly bool _inMem;
+	private readonly string _filename;
+	private IChunkHandle _handle;
+	private int _fileSize;
+
+	// This field establishes happens-before relationship with _fileStreams as follows:
+	// if _isReadOnly is not 0, then _fileStreams fully initialized
+	private int _isReadOnly;
+	private ChunkHeader _chunkHeader;
+	private ChunkFooter _chunkFooter;
+
+	private ReaderWorkItemPool _fileStreams;
+	private ReaderWorkItemPool _memStreams;
+
+	// This field established happens-before relationship with _memStreams as follows:
+	// if _memStreams has at least one available item in the pool then _sharedMemStream != null
+	private Stream _sharedMemStream;
+	private int _fileStreamCount;
+	private int _memStreamCount;
+	private int _cleanedUpFileStreams;
+
+	private WriterWorkItem _writerWorkItem;
+	private long _logicalDataSize;
+	private volatile int _physicalDataSize;
+
+	// the lock protects all three parts of the caching process:
+	// CacheInMemory, UnCacheFromMemory and TryDestructMemStreams
+	// so that the variables _cacheStatus, _cachedData, and _cachedLength are synchronized by the lock,
+	// and so is the creation and removal of the mem readers.
+	// previously TryDestructMemStreams could run concurrently with CacheInMemory,
+	// potentially causing problems.
+	private readonly AsyncExclusiveLock _cachedDataLock = new();
+	private volatile nint _cachedData;
+	// When the chunk is Cached/Uncaching, _cachedDataTransformed indicates whether _cachedData has had the transformation applied
+	private bool _cachedDataTransformed;
+	private int _cachedLength;
+	private volatile CacheStatus _cacheStatus;
+
+	private enum CacheStatus {
+		// The default state.
+		// CacheInMemory can transition us to Cached
+		// invariants: _cachedData == IntPtr.Zero, _memStreamCount == 0
+		Uncached = 0,
+
+		// UnCacheFromMemory can transition us to Uncaching
+		// invariants: _cachedData != IntPtr.Zero, _memStreamCount > 0
+		Cached,
+
+		// TryDestructMemStreams can transition us to Uncached
+		// The chunk is still cached but the process of uncaching has been started by
+		// UnCacheFromMemory. We are waiting for readers to be returned.
+		// invariants: _cachedData != IntPtr.Zero, _memStreamCount > 0
+		Uncaching,
+	}
+
+	private readonly ManualResetEventSlim _destroyEvent = new ManualResetEventSlim(false);
+	private volatile bool _selfdestructin54321;
+	private volatile bool _deleteFile;
+	private readonly bool _unbuffered;
+	private readonly bool _writeThrough;
+
+	// https://learn.microsoft.com/en-US/troubleshoot/windows-server/application-management/operating-system-performance-degrades
+	private readonly bool _reduceFileCachePressure;
+	private readonly IChunkFileSystem _fileSystem;
+
+	private IChunkReadSide _readSide;
+
+	private readonly IGetChunkTransformFactory _getTransformFactory;
+	private IChunkTransform _transform;
+	private ReadOnlyMemory<byte> _transformHeader;
+
+	private TFChunk(string filename,
+		int midpointsDepth,
+		bool inMem,
+		bool unbuffered,
+		bool writethrough,
+		bool reduceFileCachePressure,
+		IChunkFileSystem fileSystem,
+		IGetChunkTransformFactory getTransformFactory) {
+		Ensure.NotNullOrEmpty(filename, "filename");
+		Ensure.Nonnegative(midpointsDepth, "midpointsDepth");
+
+		_filename = filename;
+		_midpointsDepth = midpointsDepth;
+		_inMem = inMem;
+		_unbuffered = unbuffered;
+		_writeThrough = writethrough;
+		_reduceFileCachePressure = reduceFileCachePressure;
+		_memStreams = new();
+		_fileStreams = new();
+		_fileSystem = fileSystem;
+		_getTransformFactory = getTransformFactory;
+
+		IsRemote = !_inMem && _fileSystem.IsRemote(ChunkLocator);
+
+		// Workaround: the lock is used by the finalizer. When the finalizer is called by .NET,
+		// the lock is already finalized (and Dispose is called) and cannot be used. To avoid that situation,
+		// we suppress the finalizer for the lock. Anyway, the lock doesn't hold any unmanaged resources.
+		GC.SuppressFinalize(_cachedDataLock);
+	}
+
+	~TFChunk() {
+		FreeCachedData();
+	}
+
+	// local or remote
+	public static async ValueTask<TFChunk> FromCompletedFile(IChunkFileSystem fileSystem, string filename, bool verifyHash, bool unbufferedRead,
+		ITransactionFileTracker tracker, IGetChunkTransformFactory getTransformFactory,
+		bool reduceFileCachePressure = false, CancellationToken token = default) {
+
+		var chunk = new TFChunk(
+			filename,
+			TFConsts.MidpointsDepth,
+			false,
+			unbufferedRead,
+			false,
+			reduceFileCachePressure,
+			fileSystem,
+			getTransformFactory);
+
+		try {
+			await chunk.InitCompleted(verifyHash, tracker, getTransformFactory, token);
+		} catch {
+			chunk.Dispose();
+			throw;
 		}
 
-		public const byte CurrentChunkVersion = 3;
-		public const int WriteBufferSize = 8192;
-		public const int ReadBufferSize = 8192;
+		return chunk;
+	}
 
-		private static readonly ILogger Log = Serilog.Log.ForContext<TFChunk>();
-
-		public bool IsReadOnly {
-			get { return _isReadOnly; }
+	// always local
+	public static async ValueTask<TFChunk> FromOngoingFile(IChunkFileSystem fileSystem, string filename, int writePosition, bool unbuffered,
+		bool writethrough, bool reduceFileCachePressure, ITransactionFileTracker tracker,
+		IGetChunkTransformFactory getTransformFactory,
+		CancellationToken token) {
+		var chunk = new TFChunk(filename,
+			TFConsts.MidpointsDepth,
+			false,
+			unbuffered,
+			writethrough,
+			reduceFileCachePressure,
+			fileSystem: fileSystem,
+			getTransformFactory: getTransformFactory);
+		try {
+			await chunk.InitOngoing(writePosition, tracker, getTransformFactory, token);
+		} catch {
+			chunk.Dispose();
+			throw;
 		}
 
-		public bool IsCached {
-			get { return _isCached != 0; }
+		return chunk;
+	}
+
+	// always local
+	public static async ValueTask<TFChunk> CreateNew(
+		IChunkFileSystem fileSystem,
+		string filename,
+		int chunkDataSize,
+		int chunkStartNumber,
+		int chunkEndNumber,
+		bool isScavenged,
+		bool inMem,
+		bool unbuffered,
+		bool writethrough,
+		bool reduceFileCachePressure,
+		ITransactionFileTracker tracker,
+		IGetChunkTransformFactory getTransformFactory,
+		CancellationToken token) {
+		var transformFactory = getTransformFactory.ForNewChunk();
+		var version = CurrentChunkVersion;
+		var minCompatibleVersion = transformFactory.Type == TransformType.Identity
+			? (byte) ChunkVersions.Aligned
+			: version;
+
+		var chunkHeader = new ChunkHeader(version, minCompatibleVersion, chunkDataSize, chunkStartNumber, chunkEndNumber,
+			isScavenged, Guid.NewGuid(), transformFactory.Type);
+		var fileSize = GetAlignedSize(transformFactory.TransformDataPosition(chunkDataSize) + ChunkHeader.Size + ChunkFooter.Size);
+
+		var transformHeader = transformFactory.TransformHeaderLength > 0
+			? new byte[transformFactory.TransformHeaderLength]
+			: [];
+
+		transformFactory.CreateTransformHeader(transformHeader);
+
+		return await CreateWithHeader(fileSystem, filename, chunkHeader, fileSize, inMem, unbuffered, writethrough,
+			reduceFileCachePressure, tracker, transformFactory, getTransformFactory, transformHeader, token);
+	}
+
+	// always local
+	public static async ValueTask<TFChunk> CreateWithHeader(
+		IChunkFileSystem fileSystem,
+		string filename,
+		ChunkHeader header,
+		int fileSize,
+		bool inMem,
+		bool unbuffered,
+		bool writethrough,
+		bool reduceFileCachePressure,
+		ITransactionFileTracker tracker,
+		IChunkTransformFactory transformFactory,
+		IGetChunkTransformFactory getTransformFactory,
+		ReadOnlyMemory<byte> transformHeader,
+		CancellationToken token) {
+		var chunk = new TFChunk(filename,
+			TFConsts.MidpointsDepth,
+			inMem,
+			unbuffered,
+			writethrough,
+			reduceFileCachePressure,
+			fileSystem: fileSystem,
+			getTransformFactory: getTransformFactory);
+		try {
+			await chunk.InitNew(header, fileSize, tracker, transformFactory, transformHeader, token);
+		} catch {
+			chunk.Dispose();
+			throw;
 		}
 
-		// the logical size of data (could be > PhysicalDataSize if scavenged chunk)
-		public long LogicalDataSize {
-			get { return Interlocked.Read(ref _logicalDataSize); }
-		}
+		return chunk;
+	}
 
-		// the physical size of data size of data
-		public int PhysicalDataSize {
-			get { return _physicalDataSize; }
-		}
+	private async ValueTask InitCompleted(bool verifyHash, ITransactionFileTracker tracker,
+		IGetChunkTransformFactory getTransformFactory, CancellationToken token) {
+		_handle = await _fileSystem.OpenForReadAsync(
+			ChunkLocator,
+			_reduceFileCachePressure
+				? IChunkFileSystem.ReadOptimizationHint.None
+				: IChunkFileSystem.ReadOptimizationHint.RandomAccess,
+			token);
+		await _fileSystem.SetReadOnlyAsync(ChunkLocator, true, token);
+		_fileSize = (int)_handle.Length;
 
-		public string FileName {
-			get { return _filename; }
-		}
+		IsReadOnly = true;
 
-		public int FileSize {
-			get { return _fileSize; }
-		}
+		await using (var stream = _handle.CreateStream()) {
+			_chunkHeader = await ReadHeader(stream, token);
+			Log.Debug("Opened completed {chunk} as version {version} (min. compatible version: {minCompatibleVersion})", ChunkLocator, _chunkHeader.Version, _chunkHeader.MinCompatibleVersion);
 
-		public ChunkHeader ChunkHeader {
-			get { return _chunkHeader; }
-		}
-
-		public ChunkFooter ChunkFooter {
-			get { return _chunkFooter; }
-		}
-
-		public readonly int MidpointsDepth;
-
-		public int RawWriterPosition {
-			get {
-				var writerWorkItem = _writerWorkItem;
-				if (writerWorkItem == null)
-					throw new InvalidOperationException(string.Format("TFChunk {0} is not in write mode.", _filename));
-				return (int)writerWorkItem.StreamPosition;
-			}
-		}
-
-		private readonly bool _inMem;
-		private readonly string _filename;
-		private int _fileSize;
-		private volatile bool _isReadOnly;
-		private ChunkHeader _chunkHeader;
-		private ChunkFooter _chunkFooter;
-
-		private readonly int _maxReaderCount;
-		private readonly ConcurrentQueue<ReaderWorkItem> _fileStreams = new ConcurrentQueue<ReaderWorkItem>();
-		private readonly ConcurrentQueue<ReaderWorkItem> _memStreams = new ConcurrentQueue<ReaderWorkItem>();
-		private int _internalStreamsCount;
-		private int _fileStreamCount;
-		private int _memStreamCount;
-
-		private WriterWorkItem _writerWorkItem;
-		private long _logicalDataSize;
-		private volatile int _physicalDataSize;
-
-		private volatile IntPtr _cachedData;
-		private int _cachedLength;
-		private volatile int _isCached;
-
-		private readonly ManualResetEventSlim _destroyEvent = new ManualResetEventSlim(false);
-		private volatile bool _selfdestructin54321;
-		private volatile bool _deleteFile;
-		private bool _unbuffered;
-		private bool _writeThrough;
-		private readonly bool _reduceFileCachePressure;
-
-		private IChunkReadSide _readSide;
-
-		private TFChunk(string filename,
-			int initialReaderCount,
-			int maxReaderCount,
-			int midpointsDepth,
-			bool inMem,
-			bool unbuffered,
-			bool writethrough,
-			bool reduceFileCachePressure) {
-			Ensure.NotNullOrEmpty(filename, "filename");
-			Ensure.Positive(initialReaderCount, "initialReaderCount");
-			Ensure.Positive(maxReaderCount, "maxReaderCount");
-			if (initialReaderCount > maxReaderCount)
-				throw new ArgumentOutOfRangeException("initialReaderCount",
-					"initialReaderCount is greater than maxReaderCount.");
-			Ensure.Nonnegative(midpointsDepth, "midpointsDepth");
-
-			_filename = filename;
-			_internalStreamsCount = initialReaderCount;
-			_maxReaderCount = maxReaderCount;
-			MidpointsDepth = midpointsDepth;
-			_inMem = inMem;
-			_unbuffered = unbuffered;
-			_writeThrough = writethrough;
-			_reduceFileCachePressure = reduceFileCachePressure;
-		}
-
-		~TFChunk() {
-			FreeCachedData();
-		}
-
-		public static TFChunk FromCompletedFile(string filename, bool verifyHash, bool unbufferedRead,
-			int initialReaderCount, int maxReaderCount, bool optimizeReadSideCache = false, bool reduceFileCachePressure = false) {
-			var chunk = new TFChunk(filename, initialReaderCount, maxReaderCount,
-				TFConsts.MidpointsDepth, false, unbufferedRead, false, reduceFileCachePressure);
-			try {
-				chunk.InitCompleted(verifyHash, optimizeReadSideCache);
-			} catch {
-				chunk.Dispose();
-				throw;
-			}
-
-			return chunk;
-		}
-
-		public static TFChunk FromOngoingFile(string filename, int writePosition, bool checkSize, bool unbuffered,
-			bool writethrough, int initialReaderCount, int maxReaderCount, bool reduceFileCachePressure) {
-			var chunk = new TFChunk(filename,
-				initialReaderCount,
-				maxReaderCount,
-				TFConsts.MidpointsDepth,
-				false,
-				unbuffered,
-				writethrough, reduceFileCachePressure);
-			try {
-				chunk.InitOngoing(writePosition, checkSize);
-			} catch {
-				chunk.Dispose();
-				throw;
-			}
-
-			return chunk;
-		}
-
-		public static TFChunk CreateNew(string filename,
-			int chunkSize,
-			int chunkStartNumber,
-			int chunkEndNumber,
-			bool isScavenged,
-			bool inMem,
-			bool unbuffered,
-			bool writethrough,
-			int initialReaderCount,
-			int maxReaderCount,
-			bool reduceFileCachePressure) {
-			var size = GetAlignedSize(chunkSize + ChunkHeader.Size + ChunkFooter.Size);
-			var chunkHeader = new ChunkHeader(CurrentChunkVersion, chunkSize, chunkStartNumber, chunkEndNumber,
-				isScavenged, Guid.NewGuid());
-			return CreateWithHeader(filename, chunkHeader, size, inMem, unbuffered, writethrough, initialReaderCount, maxReaderCount,
-				reduceFileCachePressure);
-		}
-
-		public static TFChunk CreateWithHeader(string filename,
-			ChunkHeader header,
-			int fileSize,
-			bool inMem,
-			bool unbuffered,
-			bool writethrough,
-			int initialReaderCount,
-			int maxReaderCount,
-			bool reduceFileCachePressure) {
-			var chunk = new TFChunk(filename,
-				initialReaderCount,
-				maxReaderCount,
-				TFConsts.MidpointsDepth,
-				inMem,
-				unbuffered,
-				writethrough,
-				reduceFileCachePressure);
-			try {
-				chunk.InitNew(header, fileSize);
-			} catch {
-				chunk.Dispose();
-				throw;
-			}
-
-			return chunk;
-		}
-
-		private void InitCompleted(bool verifyHash, bool optimizeReadSideCache) {
-			var fileInfo = new FileInfo(_filename);
-			if (!fileInfo.Exists)
-				throw new CorruptDatabaseException(new ChunkNotFoundException(_filename));
-
-			_fileSize = (int)fileInfo.Length;
-			_isReadOnly = true;
-			SetAttributes(_filename, true);
-			CreateReaderStreams();
-
-			var reader = GetReaderWorkItem();
-			try {
-				_chunkHeader = ReadHeader(reader.Stream);
-				Log.Debug("Opened completed {chunk} as version {version}", _filename, _chunkHeader.Version);
-				if (_chunkHeader.Version != (byte)ChunkVersions.Unaligned &&
-				    _chunkHeader.Version != (byte)ChunkVersions.Aligned)
-					throw new CorruptDatabaseException(new WrongFileVersionException(_filename, _chunkHeader.Version,
-						CurrentChunkVersion));
-
-				if (_chunkHeader.Version != (byte)ChunkVersions.Aligned && _unbuffered) {
-					throw new Exception(
-						"You can only run unbuffered mode on v3 or higher chunk files. Please run scavenge on your database to upgrade your transaction file to v3.");
-				}
-
-				_chunkFooter = ReadFooter(reader.Stream);
-				if (!_chunkFooter.IsCompleted) {
-					throw new CorruptDatabaseException(new BadChunkInDatabaseException(
-						string.Format("Chunk file '{0}' should be completed, but is not.", _filename)));
-				}
-
-				_logicalDataSize = _chunkFooter.LogicalDataSize;
-				_physicalDataSize = _chunkFooter.PhysicalDataSize;
-				var expectedFileSize = _chunkFooter.PhysicalDataSize + _chunkFooter.MapSize + ChunkHeader.Size +
-				                       ChunkFooter.Size;
-				if (_chunkHeader.Version == (byte)ChunkVersions.Unaligned && reader.Stream.Length != expectedFileSize) {
-					throw new CorruptDatabaseException(new BadChunkInDatabaseException(
-						string.Format(
-							"Chunk file '{0}' should have a file size of {1} bytes, but it has a size of {2} bytes.",
-							_filename,
-							expectedFileSize,
-							reader.Stream.Length)));
-				}
-			} finally {
-				ReturnReaderWorkItem(reader);
-			}
-
-			_readSide = _chunkHeader.IsScavenged
-				? (IChunkReadSide)new TFChunkReadSideScavenged(this, optimizeReadSideCache)
-				: new TFChunkReadSideUnscavenged(this);
-			_readSide.Cache();
-
-			if (verifyHash)
-				VerifyFileHash();
-		}
-
-		private void InitNew(ChunkHeader chunkHeader, int fileSize) {
-			Ensure.NotNull(chunkHeader, "chunkHeader");
-			Ensure.Positive(fileSize, "fileSize");
-
-			_fileSize = fileSize;
-			_isReadOnly = false;
-			_chunkHeader = chunkHeader;
-			_physicalDataSize = 0;
-			_logicalDataSize = 0;
-
-			if (_inMem)
-				CreateInMemChunk(chunkHeader, fileSize);
-			else {
-				CreateWriterWorkItemForNewChunk(chunkHeader, fileSize);
-				SetAttributes(_filename, false);
-				CreateReaderStreams();
-			}
-
-			_readSide = chunkHeader.IsScavenged
-				? (IChunkReadSide)new TFChunkReadSideScavenged(this, false)
-				: new TFChunkReadSideUnscavenged(this);
-		}
-
-		private void InitOngoing(int writePosition, bool checkSize) {
-			Ensure.Nonnegative(writePosition, "writePosition");
-			var fileInfo = new FileInfo(_filename);
-			if (!fileInfo.Exists)
-				throw new CorruptDatabaseException(new ChunkNotFoundException(_filename));
-
-			_fileSize = (int)fileInfo.Length;
-			_isReadOnly = false;
-			_physicalDataSize = writePosition;
-			_logicalDataSize = writePosition;
-
-			SetAttributes(_filename, false);
-			CreateWriterWorkItemForExistingChunk(writePosition, out _chunkHeader);
-			Log.Debug("Opened ongoing {chunk} as version {version}", _filename, _chunkHeader.Version);
-			if (_chunkHeader.Version != (byte)ChunkVersions.Aligned &&
-			    _chunkHeader.Version != (byte)ChunkVersions.Unaligned)
-				throw new CorruptDatabaseException(new WrongFileVersionException(_filename, _chunkHeader.Version,
+			if (_chunkHeader.MinCompatibleVersion > CurrentChunkVersion)
+				throw new CorruptDatabaseException(new UnsupportedFileVersionException(ChunkLocator, _chunkHeader.MinCompatibleVersion,
 					CurrentChunkVersion));
-			CreateReaderStreams();
 
-			if (checkSize) {
-				var expectedFileSize = _chunkHeader.ChunkSize + ChunkHeader.Size + ChunkFooter.Size;
-				if (_writerWorkItem.StreamLength != expectedFileSize) {
-					throw new CorruptDatabaseException(new BadChunkInDatabaseException(
-						string.Format(
-							"Chunk file '{0}' should have file size {1} bytes, but instead has {2} bytes length.",
-							_filename,
-							expectedFileSize,
-							_writerWorkItem.StreamLength)));
-				}
+			var transformFactory = getTransformFactory.ForExistingChunk(_chunkHeader.TransformType);
+
+			var transformHeader = transformFactory.TransformHeaderLength > 0
+				? new byte[transformFactory.TransformHeaderLength]
+				: [];
+			await transformFactory.ReadTransformHeader(stream, transformHeader, token);
+			_transformHeader = transformHeader;
+			_transform = transformFactory.CreateTransform(transformHeader);
+
+			_chunkFooter = await ReadFooter(stream, token);
+			if (!_chunkFooter.IsCompleted) {
+				throw new CorruptDatabaseException(new BadChunkInDatabaseException(
+					$"Chunk file '{ChunkLocator}' should be completed, but is not."));
 			}
 
-			_readSide = new TFChunkReadSideUnscavenged(this);
+			_logicalDataSize = _chunkFooter.LogicalDataSize;
+			_physicalDataSize = _chunkFooter.PhysicalDataSize;
 		}
 
+		CreateReaderStreams();
 
-		private void Alignv2File(string filename) {
-			//takes a v2 file and aligns it so it can be used with unbuffered
-			try {
-				SetAttributes(filename, false);
-				using (var stream =
-					new FileStream(filename, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite)) {
-					if (stream.Length % 4096 == 0) return;
-					var footerStart = stream.Length - ChunkFooter.Size;
-					var alignedSize = (stream.Length / 4096 + 1) * 4096;
-					var footer = new byte[ChunkFooter.Size];
-					stream.SetLength(alignedSize);
-					stream.Seek(footerStart, SeekOrigin.Begin);
-					stream.Read(footer, 0, ChunkFooter.Size);
-					stream.Seek(footerStart, SeekOrigin.Begin);
-					var bytes = new byte[alignedSize - footerStart - ChunkFooter.Size];
-					stream.Write(bytes, 0, bytes.Length);
-					stream.Write(footer, 0, footer.Length);
-				}
-			} finally {
-				SetAttributes(filename, true);
-			}
+		_readSide = _chunkHeader.IsScavenged
+			? new TFChunkReadSideScavenged(this, tracker)
+			: new TFChunkReadSideUnscavenged(this, tracker);
+
+		// do not actually cache now because it is too slow when opening the database
+		_readSide.RequestCaching();
+
+		if (verifyHash)
+			await VerifyFileHash(token);
+	}
+
+	private async ValueTask InitNew(ChunkHeader chunkHeader, int fileSize, ITransactionFileTracker tracker,
+		IChunkTransformFactory transformFactory,
+		ReadOnlyMemory<byte> transformHeader,
+		CancellationToken token) {
+		Ensure.NotNull(chunkHeader, "chunkHeader");
+		Ensure.Positive(fileSize, "fileSize");
+
+		_fileSize = fileSize;
+		IsReadOnly = false;
+		_chunkHeader = chunkHeader;
+		_physicalDataSize = 0;
+		_logicalDataSize = 0;
+
+		_transformHeader = transformHeader;
+		_transform = transformFactory.CreateTransform(transformHeader.Span);
+
+		if (_inMem)
+			await CreateInMemChunk(chunkHeader, fileSize, transformHeader, token);
+		else {
+			await CreateWriterWorkItemForNewChunk(chunkHeader, fileSize, transformHeader, token);
 		}
 
-		private void CreateReaderStreams() {
-			Interlocked.Add(ref _fileStreamCount, _internalStreamsCount);
-			for (int i = 0; i < _internalStreamsCount; i++) {
-				_fileStreams.Enqueue(CreateInternalReaderWorkItem());
-			}
+		_readSide = chunkHeader.IsScavenged
+			? new TFChunkReadSideScavenged(this, tracker)
+			: new TFChunkReadSideUnscavenged(this, tracker);
+
+		// Always cache the active chunk
+		// If the chunk is scavenged we will definitely mark it readonly before we are done writing to it.
+		if (!chunkHeader.IsScavenged) {
+			await CacheInMemory(token);
+		}
+	}
+
+	private async ValueTask InitOngoing(int writePosition, ITransactionFileTracker tracker,
+		IGetChunkTransformFactory getTransformFactory,
+		CancellationToken token) {
+		Ensure.Nonnegative(writePosition, "writePosition");
+		var fileInfo = new FileInfo(LocalFileName);
+		if (!fileInfo.Exists)
+			throw new CorruptDatabaseException(new ChunkNotFoundException(ChunkLocator));
+
+		_fileSize = (int)fileInfo.Length;
+		IsReadOnly = false;
+		_physicalDataSize = writePosition;
+		_logicalDataSize = writePosition;
+
+		await _fileSystem.SetReadOnlyAsync(fileInfo.FullName, false, token);
+		_chunkHeader = await CreateWriterWorkItemForExistingChunk(writePosition, getTransformFactory, token);
+		Log.Debug("Opened ongoing {chunk} as version {version} (min. compatible version: {minCompatibleVersion})", ChunkLocator, _chunkHeader.Version, _chunkHeader.MinCompatibleVersion);
+
+		if (_chunkHeader.MinCompatibleVersion > CurrentChunkVersion)
+			throw new CorruptDatabaseException(new UnsupportedFileVersionException(ChunkLocator, _chunkHeader.MinCompatibleVersion,
+				CurrentChunkVersion));
+
+		_readSide = new TFChunkReadSideUnscavenged(this, tracker);
+
+		// Always cache the active chunk
+		await CacheInMemory(token);
+	}
+
+	// If one file stream writes to a file, and another file stream happens to have that part of
+	// the same file already in its buffer, the buffer is not (any longer) invalidated and a read from
+	// the second file stream will not contain the write.
+	// We therefore only read from memory while the chunk is still being written to, and only create
+	// the file streams when the chunk is being completed.
+	private void CreateReaderStreams() {
+		_fileStreams.Reuse();
+		Interlocked.Add(ref _fileStreamCount, IndexPool.Capacity);
+	}
+
+	private async ValueTask CreateInMemChunk(ChunkHeader chunkHeader, int fileSize, ReadOnlyMemory<byte> transformHeader, CancellationToken token) {
+		var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+
+		// ALLOCATE MEM
+		_cacheStatus = CacheStatus.Cached;
+		_cachedLength = fileSize;
+		_cachedData = Marshal.AllocHGlobal(_cachedLength);
+		_cachedDataTransformed = true;
+		GC.AddMemoryPressure(_cachedLength);
+
+
+		// WRITE HEADERS
+		await using (var headerStream = CreateMemoryStream(_cachedLength, FileAccess.ReadWrite)) {
+			await WriteHeader(md5, headerStream, chunkHeader, token);
+			await WriteTransformHeader(md5, headerStream, transformHeader, token);
 		}
 
-		private ReaderWorkItem CreateInternalReaderWorkItem() {
-			Stream stream;
-			if (_unbuffered) {
-				stream = UnbufferedFileStream.Create(
-					_filename,
-					FileMode.Open,
-					FileAccess.Read,
-					FileShare.ReadWrite,
-					false,
-					1024 * 1024,
-					4096,
-					false,
-					4096);
-			} else {
-				stream = new FileStream(
-					_filename,
-					FileMode.Open,
-					FileAccess.Read,
-					FileShare.ReadWrite,
-					ReadBufferSize,
-					_reduceFileCachePressure ? FileOptions.None : FileOptions.RandomAccess);
-			}
+		// WRITER STREAM
+		var writerWorkItem = new WriterWorkItem(_cachedData, _cachedLength, md5, _transform.Write, ChunkHeader.Size + transformHeader.Length);
 
-			var reader = new BinaryReader(stream);
-			return new ReaderWorkItem(stream, reader, false);
+		// READER STREAMS
+		_sharedMemStream = CreateSharedMemoryStream();
+		Interlocked.Add(ref _memStreamCount, IndexPool.Capacity);
+		_memStreams.Reuse();
+
+		// should never happen in practice because this function is called from the static TFChunk constructors
+		Debug.Assert(!_selfdestructin54321);
+
+		_writerWorkItem = writerWorkItem;
+	}
+
+	private unsafe Stream CreateSharedMemoryStream() {
+		Debug.Assert(_cachedData is not 0);
+		Debug.Assert(_cachedLength > 0);
+
+		ReadOnlyMemory<byte> memoryView = UnmanagedMemory.AsMemory((byte*)_cachedData, _cachedLength);
+		return StreamSource.AsSharedStream(new(memoryView), compatWithAsync: true);
+	}
+
+	private FileOptions WritableHandleOptions {
+		get {
+			var options = _reduceFileCachePressure
+				? ChunkFileHandle.DefaultFileOptions
+				: ChunkFileHandle.DefaultFileOptions | FileOptions.RandomAccess;
+			if (_writeThrough)
+				options |= FileOptions.WriteThrough;
+
+			return options;
 		}
+	}
 
-		private void CreateInMemChunk(ChunkHeader chunkHeader, int fileSize) {
-			var md5 = MD5.Create();
+	private async ValueTask CreateWriterWorkItemForNewChunk(ChunkHeader chunkHeader, int fileSize, ReadOnlyMemory<byte> transformHeader, CancellationToken token) {
+		var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
 
-			// ALLOCATE MEM
-			Interlocked.Exchange(ref _isCached, 1);
-			_cachedLength = fileSize;
-			_cachedData = Marshal.AllocHGlobal(_cachedLength);
+		// create temp file first and set desired length
+		// if there is not enough disk space or something else prevents file to be resized as desired
+		// we'll end up with empty temp file, which won't trigger false error on next DB verification
+		var tempFilename = $"{LocalFileName}.{Guid.NewGuid()}.tmp";
+		var options = new FileStreamOptions {
+			Mode = FileMode.CreateNew,
+			Access = FileAccess.ReadWrite,
+			Share = FileShare.Read,
+			Options = FileOptions.SequentialScan | ChunkFileHandle.DefaultFileOptions,
+			PreallocationSize = fileSize, // avoid fragmentation of file
+			BufferSize = WriterWorkItem.BufferSize,
+		};
 
-			// WRITER STREAM
-			var memStream =
-				new UnmanagedMemoryStream((byte*)_cachedData, _cachedLength, _cachedLength, FileAccess.ReadWrite);
-			WriteHeader(md5, memStream, chunkHeader);
-			memStream.Position = ChunkHeader.Size;
-
-			// READER STREAMS
-			Interlocked.Add(ref _memStreamCount, _maxReaderCount);
-			for (int i = 0; i < _maxReaderCount; i++) {
-				var stream = new UnmanagedMemoryStream((byte*)_cachedData, _cachedLength);
-				var reader = new BinaryReader(stream);
-				_memStreams.Enqueue(new ReaderWorkItem(stream, reader, isMemory: true));
-			}
-
-			_writerWorkItem = new WriterWorkItem(null, memStream, md5);
-		}
-
-		private void CreateWriterWorkItemForNewChunk(ChunkHeader chunkHeader, int fileSize) {
-			var md5 = MD5.Create();
-
-			// create temp file first and set desired length
-			// if there is not enough disk space or something else prevents file to be resized as desired
-			// we'll end up with empty temp file, which won't trigger false error on next DB verification
-			var tempFilename = string.Format("{0}.{1}.tmp", _filename, Guid.NewGuid());
-			var tempFile = new FileStream(tempFilename, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read,
-				WriteBufferSize, FileOptions.SequentialScan);
+		await using (var tempFile = new FileStream(tempFilename, options)) {
 			tempFile.SetLength(fileSize);
 
 			// we need to write header into temp file before moving it into correct chunk place, so in case of crash
 			// we don't end up with seemingly valid chunk file with no header at all...
-			WriteHeader(md5, tempFile, chunkHeader);
+			await WriteHeader(md5, tempFile, chunkHeader, token);
+			await WriteTransformHeader(md5, tempFile, transformHeader, token);
 
 			tempFile.FlushToDisk();
-			tempFile.Close();
-			File.Move(tempFilename, _filename);
-			Stream stream = GetWriteStream(_filename);
-			stream.Position = ChunkHeader.Size;
-			_writerWorkItem = new WriterWorkItem(stream, null, md5);
-			Flush(); // persist file move result
 		}
 
-		private Stream GetWriteStream(string filename) {
-			if (!_unbuffered) {
-				return new FileStream(
-					_filename,
-					FileMode.Open,
-					FileAccess.ReadWrite,
-					FileShare.Read,
-					WriteBufferSize,
-					FileOptions.SequentialScan);
-			} else {
-				Log.Debug("Using unbuffered access for TFChunk '{chunk}'...", _filename);
-				return UnbufferedFileStream.Create(
-					_filename,
-					FileMode.Open,
-					FileAccess.ReadWrite,
-					FileShare.Read,
+		File.Move(tempFilename, LocalFileName);
+
+		// reuse FileStreamOptions instance
+		options.Mode = FileMode.Open;
+		options.Options = WritableHandleOptions;
+		options.PreallocationSize = 0L;
+		_handle = ChunkFileHandle.Create(LocalFileName, options);
+		_writerWorkItem = new(_handle, md5, _unbuffered, _transform.Write, ChunkHeader.Size + transformHeader.Length);
+		await _fileSystem.SetReadOnlyAsync(LocalFileName, false, token);
+	}
+
+	private async ValueTask<ChunkHeader> CreateWriterWorkItemForExistingChunk(int writePosition,
+		IGetChunkTransformFactory getTransformFactory,
+		CancellationToken token) {
+		var options = new FileStreamOptions {
+			Mode = FileMode.Open,
+			Access = FileAccess.ReadWrite,
+			Share = FileShare.Read,
+			Options = WritableHandleOptions,
+		};
+
+		_handle = ChunkFileHandle.Create(LocalFileName, options);
+
+		var stream = _handle.CreateStream();
+		ChunkHeader chunkHeader;
+		try {
+			chunkHeader = await ReadHeader(stream, token);
+			if (chunkHeader.Version is (byte)ChunkVersions.Unaligned) {
+				Log.Debug("Upgrading ongoing file {chunk} to version 3", ChunkLocator);
+				var newHeader = new ChunkHeader((byte)ChunkVersions.Aligned,
+					(byte)ChunkVersions.Aligned,
+					chunkHeader.ChunkSize,
+					chunkHeader.ChunkStartNumber,
+					chunkHeader.ChunkEndNumber,
 					false,
-					4096 * 1024,
-					4096,
-					_writeThrough,
-					4096);
-			}
-		}
+					chunkHeader.ChunkId,
+					chunkHeader.TransformType);
+				stream.Seek(0, SeekOrigin.Begin);
+				chunkHeader = newHeader;
 
-		private void CreateWriterWorkItemForExistingChunk(int writePosition, out ChunkHeader chunkHeader) {
-			var md5 = MD5.Create();
-			var stream = GetWriteStream(_filename);
-			try {
-				chunkHeader = ReadHeader(stream);
-				if (chunkHeader.Version == (byte)ChunkVersions.Unaligned) {
-					Log.Debug("Upgrading ongoing file {chunk} to version 3", _filename);
-					var newHeader = new ChunkHeader((byte)ChunkVersions.Aligned,
-						chunkHeader.ChunkSize,
-						chunkHeader.ChunkStartNumber,
-						chunkHeader.ChunkEndNumber,
-						false,
-						chunkHeader.ChunkId);
-					stream.Seek(0, SeekOrigin.Begin);
-					chunkHeader = newHeader;
-					var head = newHeader.AsByteArray();
-					stream.Write(head, 0, head.Length);
-					stream.Flush();
-					stream.Seek(0, SeekOrigin.Begin);
+				using (var buffer = Memory.AllocateExactly<byte>(ChunkHeader.Size)) {
+					await stream.WriteAsync(newHeader, buffer.Memory, token);
 				}
-			} catch {
-				stream.Dispose();
-				((IDisposable)md5).Dispose();
-				throw;
+
+				await stream.FlushAsync(token);
 			}
 
-			var realPosition = GetRawPosition(writePosition);
-			MD5Hash.ContinuousHashFor(md5, stream, 0, realPosition);
-			stream.Position = realPosition; // this reordering fixes bug in Mono implementation of FileStream
-			_writerWorkItem = new WriterWorkItem(stream, null, md5);
+			var transformFactory = getTransformFactory.ForExistingChunk(chunkHeader.TransformType);
+
+			var transformHeader = transformFactory.TransformHeaderLength > 0
+				? new byte[transformFactory.TransformHeaderLength]
+				: [];
+			await transformFactory.ReadTransformHeader(stream, transformHeader, token);
+			_transformHeader = transformHeader;
+			_transform = transformFactory.CreateTransform(transformHeader);
+		} catch {
+			_handle.Dispose();
+			throw;
+		} finally {
+			await stream.DisposeAsync();
 		}
 
-		private void WriteHeader(MD5 md5, Stream stream, ChunkHeader chunkHeader) {
-			var chunkHeaderBytes = chunkHeader.AsByteArray();
-			md5.TransformBlock(chunkHeaderBytes, 0, ChunkHeader.Size, null, 0);
-			stream.Write(chunkHeaderBytes, 0, ChunkHeader.Size);
+		var workItem = new WriterWorkItem(_handle, IncrementalHash.CreateHash(HashAlgorithmName.MD5), _unbuffered, _transform.Write, 0);
+		var realPosition = GetRawPosition(writePosition);
+		// the writer work item's stream is responsible for computing the current checksum when the position is set
+		workItem.WorkingStream.Position = realPosition;
+		_writerWorkItem = workItem;
+
+		return chunkHeader;
+	}
+
+	private static async ValueTask WriteHeader(IncrementalHash md5, Stream stream, ChunkHeader chunkHeader, CancellationToken token) {
+		var chunkHeaderBytes = ArrayPool<byte>.Shared.Rent(ChunkHeader.Size);
+		try {
+			chunkHeader.Format(chunkHeaderBytes);
+			md5.AppendData(chunkHeaderBytes, 0, ChunkHeader.Size);
+			await stream.WriteAsync(chunkHeaderBytes.AsMemory(0, ChunkHeader.Size), token);
+		} finally {
+			ArrayPool<byte>.Shared.Return(chunkHeaderBytes);
+		}
+	}
+
+	private static ValueTask WriteTransformHeader(IncrementalHash md5, Stream stream, ReadOnlyMemory<byte> transformHeader, CancellationToken token) {
+		if (transformHeader.IsEmpty)
+			return ValueTask.CompletedTask;
+
+		md5.AppendData(transformHeader.Span);
+		return stream.WriteAsync(transformHeader, token);
+	}
+
+	public async ValueTask VerifyFileHash(CancellationToken token) {
+		if (!IsReadOnly)
+			throw new InvalidOperationException("You can't verify hash of not-completed TFChunk.");
+
+		if (IsRemote) {
+			Log.Debug("Skipped verifying hash for TFChunk '{chunk}' because it is remote", ChunkLocator);
+			return;
 		}
 
-		private void SetAttributes(string filename, bool isReadOnly) {
-			if (_inMem)
+		Log.Debug("Verifying hash for TFChunk '{chunk}'...", ChunkLocator);
+		using var reader = await AcquireRawReader(token);
+		reader.Stream.Seek(0, SeekOrigin.Begin);
+		var stream = reader.Stream;
+		var footer = _chunkFooter;
+
+		using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+
+		// hash whole chunk except MD5 hash sum which should always be last
+		await MD5Hash.ContinuousHashFor(md5, stream, 0, _fileSize - ChunkFooter.ChecksumSize, token);
+		VerifyHash(footer.MD5Hash, md5);
+
+		static void VerifyHash(ReadOnlySpan<byte> expected, IncrementalHash actual) {
+			Span<byte> buffer = stackalloc byte[ChunkFooter.ChecksumSize];
+			var bytesWritten = actual.GetCurrentHash(buffer);
+			Debug.Assert(bytesWritten is ChunkFooter.ChecksumSize);
+
+			// Perf: use hardware accelerated byte array comparison
+			if (!expected.SequenceEqual(buffer.Slice(0, bytesWritten)))
+				throw new HashValidationException();
+		}
+	}
+
+	private ValueTask<ChunkHeader> ReadHeader(Stream stream, CancellationToken token) {
+		if (stream.Length < ChunkHeader.Size) {
+			return ValueTask.FromException<ChunkHeader>(new CorruptDatabaseException(new BadChunkInDatabaseException(
+				$"Chunk file '{ChunkLocator}' is too short to even read ChunkHeader, its size is {stream.Length} bytes.")));
+		}
+
+		stream.Seek(0, SeekOrigin.Begin);
+		return ChunkHeader.FromStream(stream, token);
+	}
+
+	private ValueTask<ChunkFooter> ReadFooter(Stream stream, CancellationToken token) {
+		if (stream.Length < ChunkFooter.Size) {
+			return ValueTask.FromException<ChunkFooter>(new CorruptDatabaseException(new BadChunkInDatabaseException(
+				$"Chunk file '{ChunkLocator}' is too short to even read ChunkFooter, its size is {stream.Length} bytes.")));
+		}
+
+		stream.Seek(-ChunkFooter.Size, SeekOrigin.End);
+		return ChunkFooter.FromStream(stream, token);
+	}
+
+	private static long GetRawPosition(long logicalPosition) {
+		return ChunkHeader.Size + logicalPosition;
+	}
+
+	private static long GetDataPosition(WriterWorkItem workItem) {
+		return workItem.WorkingStream.Position - ChunkHeader.Size;
+	}
+
+	// There are four kinds of event position
+	// (a) global logical (logical position in the log)
+	// (b) local logical (logical position in the chunk, which is global logical - chunk logical start)
+	// (c) actual (local logical but with posmap taken into account)
+	// (d) raw (byte offset in file, which is actual - header size)
+	//
+	// this method takes (b) and returns (d)
+	public async ValueTask<long> GetActualRawPosition(long logicalPosition, CancellationToken token) {
+		ArgumentOutOfRangeException.ThrowIfNegative(logicalPosition);
+
+		var actualPosition = await _readSide.GetActualPosition(logicalPosition, token);
+
+		return actualPosition < 0 ? -1 : GetRawPosition(actualPosition);
+	}
+
+	public async ValueTask CacheInMemory(CancellationToken token) {
+		if (_inMem)
+			return;
+
+		await _cachedDataLock.AcquireAsync(token);
+		try {
+			if (_cacheStatus is not CacheStatus.Uncached) {
+				// expected to be very rare
+				if (_cacheStatus is CacheStatus.Uncaching)
+					Log.Debug("CACHING TFChunk {chunk} SKIPPED because it is uncaching.", this);
+
 				return;
-			// in mono SetAttributes on non-existing file throws exception, in windows it just works silently.
-			Helper.EatException(() => {
-				if (isReadOnly)
-					File.SetAttributes(filename, FileAttributes.ReadOnly | FileAttributes.NotContentIndexed);
-				else
-					File.SetAttributes(filename, FileAttributes.NotContentIndexed);
-			});
-		}
-
-		public void VerifyFileHash() {
-			if (!IsReadOnly)
-				throw new InvalidOperationException("You can't verify hash of not-completed TFChunk.");
-
-			Log.Debug("Verifying hash for TFChunk '{chunk}'...", _filename);
-			using (var reader = AcquireReader()) {
-				reader.Stream.Seek(0, SeekOrigin.Begin);
-				var stream = reader.Stream;
-				var footer = _chunkFooter;
-
-				byte[] hash;
-				using (var md5 = MD5.Create()) {
-					// hash header and data
-					MD5Hash.ContinuousHashFor(md5, stream, 0, ChunkHeader.Size + footer.PhysicalDataSize);
-					// hash mapping and footer except MD5 hash sum which should always be last
-					MD5Hash.ContinuousHashFor(md5,
-						stream,
-						ChunkHeader.Size + footer.PhysicalDataSize,
-						stream.Length - ChunkHeader.Size - footer.PhysicalDataSize - ChunkFooter.ChecksumSize);
-					md5.TransformFinalBlock(Empty.ByteArray, 0, 0);
-					hash = md5.Hash;
-				}
-
-				if (footer.MD5Hash == null || footer.MD5Hash.Length != hash.Length)
-					throw new HashValidationException();
-
-				for (int i = 0; i < hash.Length; ++i) {
-					if (footer.MD5Hash[i] != hash[i])
-						throw new HashValidationException();
-				}
 			}
-		}
-
-		private ChunkHeader ReadHeader(Stream stream) {
-			if (stream.Length < ChunkHeader.Size) {
-				throw new CorruptDatabaseException(new BadChunkInDatabaseException(
-					string.Format("Chunk file '{0}' is too short to even read ChunkHeader, its size is {1} bytes.",
-						_filename,
-						stream.Length)));
-			}
-
-			stream.Seek(0, SeekOrigin.Begin);
-			var chunkHeader = ChunkHeader.FromStream(stream);
-			return chunkHeader;
-		}
-
-		private ChunkFooter ReadFooter(Stream stream) {
-			if (stream.Length < ChunkFooter.Size) {
-				throw new CorruptDatabaseException(new BadChunkInDatabaseException(
-					string.Format("Chunk file '{0}' is too short to even read ChunkFooter, its size is {1} bytes.",
-						_filename,
-						stream.Length)));
-			}
-
-			try {
-				stream.Seek(-ChunkFooter.Size, SeekOrigin.End);
-				var footer = ChunkFooter.FromStream(stream);
-				return footer;
-			} catch (Exception ex) {
-				throw new Exception("error in chunk file " + _filename, ex);
-			}
-		}
-
-		private static long GetRawPosition(long logicalPosition) {
-			return ChunkHeader.Size + logicalPosition;
-		}
-
-		private static long GetDataPosition(WriterWorkItem workItem) {
-			return workItem.StreamPosition - ChunkHeader.Size;
-		}
-
-		// WARNING CacheInMemory/UncacheFromMemory should not be called simultaneously !!!
-		public void CacheInMemory() {
-			if (_inMem || Interlocked.CompareExchange(ref _isCached, 1, 0) != 0)
-				return;
 
 			// we won the right to cache
-			var sw = Stopwatch.StartNew();
+			var sw = new Timestamp();
 			try {
-				BuildCacheArray();
+				// note: we do not want to cache transformed data for the active chunk as we would be incurring the cost of
+				// transformation twice - once when writing to the filestream and once when writing to the memory stream.
+				// however, we want to cache (already) transformed data for completed/read-only chunks as we would otherwise
+				// incur the cost of transforming the whole chunk when loading data from the file into memory.
+
+				if (!IsReadOnly)
+					// we do not cache the header for the active chunk -
+					// it's not necessary as the cache is used only for reading data.
+					await BuildCacheArray(
+						size: GetAlignedSize(ChunkHeader.Size + _chunkHeader.ChunkSize + ChunkFooter.Size),
+						reader: await AcquireFileReader(raw: false, token),
+						offset: ChunkHeader.Size,
+						count: _physicalDataSize,
+						transformed: false,
+						token);
+				else
+					await BuildCacheArray(
+						size: _fileSize,
+						reader: await AcquireFileReader(raw: true, token),
+						offset: 0,
+						count: _fileSize,
+						transformed: true,
+						token);
 			} catch (OutOfMemoryException) {
 				Log.Error("CACHING FAILED due to OutOfMemory exception in TFChunk {chunk}.", this);
-				_isCached = 0;
 				return;
 			} catch (FileBeingDeletedException) {
 				Log.Debug(
 					"CACHING FAILED due to FileBeingDeleted exception (TFChunk is being disposed) in TFChunk {chunk}.",
 					this);
-				_isCached = 0;
 				return;
 			}
 
-			Interlocked.Add(ref _memStreamCount, _maxReaderCount);
+			_sharedMemStream = CreateSharedMemoryStream();
+			Interlocked.Add(ref _memStreamCount, IndexPool.Capacity);
+			_memStreams.Reuse();
+
 			if (_selfdestructin54321) {
-				if (Interlocked.Add(ref _memStreamCount, -_maxReaderCount) == 0)
-					FreeCachedData();
+				if (Interlocked.Add(ref _memStreamCount, -IndexPool.Capacity) is 0)
+					FreeCachedDataUnsafe();
 				Log.Debug("CACHING ABORTED for TFChunk {chunk} as TFChunk was probably marked for deletion.", this);
 				return;
 			}
 
-			var writerWorkItem = _writerWorkItem;
-			if (writerWorkItem != null) {
-				var memStream = new UnmanagedMemoryStream((byte*)_cachedData, _cachedLength, _cachedLength,
-					FileAccess.ReadWrite);
-				memStream.Position = writerWorkItem.StreamPosition;
-				writerWorkItem.SetMemStream(memStream);
-			}
+			if (_writerWorkItem is { } writerWorkItem) {
+				UnmanagedMemoryStream memStream;
+				unsafe {
+					memStream =
+						new((byte*)_cachedData, _cachedLength, _cachedLength, FileAccess.ReadWrite) {
+							Position = writerWorkItem.WorkingStream.Position,
+						};
+				}
 
-			for (int i = 0; i < _maxReaderCount; i++) {
-				var stream = new UnmanagedMemoryStream((byte*)_cachedData, _cachedLength);
-				var reader = new BinaryReader(stream);
-				_memStreams.Enqueue(new ReaderWorkItem(stream, reader, isMemory: true));
+				writerWorkItem.SetMemStream(memStream);
 			}
 
 			_readSide.Uncache();
@@ -628,472 +780,819 @@ namespace EventStore.Core.TransactionLog.Chunks.TFChunk {
 			Log.Debug("CACHED TFChunk {chunk} in {elapsed}.", this, sw.Elapsed);
 
 			if (_selfdestructin54321)
-				TryDestructMemStreams();
-		}
+				TryDestructMemStreamsUnsafe();
 
-		private void BuildCacheArray() {
-			var workItem = GetReaderWorkItem();
+			_cacheStatus = CacheStatus.Cached;
+		} finally {
+			_cachedDataLock.Release();
+		}
+	}
+
+	private async ValueTask BuildCacheArray(int size, TFChunkBulkReader reader, int offset, int count, bool transformed, CancellationToken token) {
+		Debug.Assert(_cachedDataLock.IsLockHeld);
+
+		try {
+			if (reader.IsMemory)
+				throw new InvalidOperationException(
+					"When trying to build cache, reader worker is already in-memory reader.");
+
+			_cachedLength = size;
+			var cachedData = Marshal.AllocHGlobal(_cachedLength);
+			GC.AddMemoryPressure(_cachedLength);
+
 			try {
-				if (workItem.IsMemory)
-					throw new InvalidOperationException(
-						"When trying to build cache, reader worker is already in-memory reader.");
-
-				var dataSize = _isReadOnly ? _physicalDataSize + ChunkFooter.MapSize : _chunkHeader.ChunkSize;
-				_cachedLength = GetAlignedSize(ChunkHeader.Size + dataSize + ChunkFooter.Size);
-				var cachedData = Marshal.AllocHGlobal(_cachedLength);
-				try {
-					using (var unmanagedStream = new UnmanagedMemoryStream((byte*)cachedData, _cachedLength,
-						_cachedLength, FileAccess.ReadWrite)) {
-						workItem.Stream.Seek(0, SeekOrigin.Begin);
-						var buffer = new byte[65536];
-						// in ongoing chunk there is no need to read everything, it's enough to read just actual data written
-						int toRead = _isReadOnly ? _cachedLength : ChunkHeader.Size + _physicalDataSize;
-						while (toRead > 0) {
-							int read = workItem.Stream.Read(buffer, 0, Math.Min(toRead, buffer.Length));
-							if (read == 0)
-								break;
-							toRead -= read;
-							unmanagedStream.Write(buffer, 0, read);
-						}
-					}
-				} catch {
-					Marshal.FreeHGlobal(cachedData);
-					throw;
+				Memory<byte> memoryView;
+				unsafe {
+					memoryView = UnmanagedMemory.AsMemory((byte*)(cachedData + offset), count);
 				}
 
-				_cachedData = cachedData;
-			} finally {
-				ReturnReaderWorkItem(workItem);
+				reader.Stream.Seek(offset, SeekOrigin.Begin);
+				await reader.Stream.ReadExactlyAsync(memoryView, token);
+			} catch {
+				Marshal.FreeHGlobal(cachedData);
+				GC.RemoveMemoryPressure(_cachedLength);
+				throw;
 			}
-		}
 
-		//WARNING CacheInMemory/UncacheFromMemory should not be called simultaneously !!!
-		public void UnCacheFromMemory() {
+			_cachedData = cachedData;
+			_cachedDataTransformed = transformed;
+		} finally {
+			reader.Dispose();
+		}
+	}
+
+	public async ValueTask UnCacheFromMemory(CancellationToken token) {
+		await _cachedDataLock.AcquireAsync(token);
+		try {
 			if (_inMem)
 				return;
-			if (Interlocked.CompareExchange(ref _isCached, 0, 1) == 1) {
+			if (_cacheStatus is CacheStatus.Cached) {
 				// we won the right to un-cache and chunk was cached
-				// NOTE: calling simultaneously cache and uncache is very dangerous
-				// NOTE: though multiple simultaneous calls to either Cache or Uncache is ok
+				// possibly we could use a mem reader work item and do the actual midpoint caching now
+				_readSide.RequestCaching();
 
-				_readSide.Cache();
+				_writerWorkItem?.DisposeMemStream();
 
-				var writerWorkItem = _writerWorkItem;
-				if (writerWorkItem != null)
-					writerWorkItem.DisposeMemStream();
-
-				TryDestructMemStreams();
-
-				Log.Debug("UNCACHED TFChunk {chunk}.", this);
+				Log.Debug("UNCACHING TFChunk {chunk}.", this);
+				_cacheStatus = CacheStatus.Uncaching;
+				// this memory barrier corresponds to the barrier in ReturnReaderWorkItem
+				Thread.MemoryBarrier();
+				TryDestructMemStreamsUnsafe();
 			}
+		} finally {
+			_cachedDataLock.Release();
+		}
+	}
+
+	public ValueTask<bool> ExistsAt(long logicalPosition, CancellationToken token)
+		=> _readSide.ExistsAt(logicalPosition, token);
+
+	public ValueTask<RecordReadResult> TryReadAt(long logicalPosition, bool couldBeScavenged, CancellationToken token)
+		=> _readSide.TryReadAt(logicalPosition, couldBeScavenged, token);
+
+	public ValueTask<RecordReadResult> TryReadFirst(CancellationToken token)
+		=> _readSide.TryReadFirst(token);
+
+	public ValueTask<RecordReadResult> TryReadClosestForward(long logicalPosition, CancellationToken token)
+		=> _readSide.TryReadClosestForward(logicalPosition, token);
+
+	public ValueTask<RawReadResult> TryReadClosestForwardRaw(long logicalPosition, Func<int, byte[]> getBuffer,
+		CancellationToken token)
+		=> _readSide.TryReadClosestForwardRaw(logicalPosition, getBuffer, token);
+
+	public ValueTask<RecordReadResult> TryReadLast(CancellationToken token)
+		=> _readSide.TryReadLast(token);
+
+	public ValueTask<RecordReadResult> TryReadClosestBackward(long logicalPosition, CancellationToken token)
+		=> _readSide.TryReadClosestBackward(logicalPosition, token);
+
+	public async ValueTask<RecordWriteResult> TryAppend(ILogRecord record, CancellationToken token) {
+		if (IsReadOnly)
+			throw new InvalidOperationException("Cannot write to a read-only block.");
+
+		var workItem = _writerWorkItem;
+		long oldPosition;
+		int length;
+		using (var dataOnDisk = SerializeLogRecord(record, out length)) {
+			oldPosition = GetDataPosition(workItem);
+			if (workItem.WorkingStream.Position + length + 2 * sizeof(int) > ChunkHeader.Size + _chunkHeader.ChunkSize)
+				return RecordWriteResult.Failed(oldPosition);
+
+			await workItem.AppendData(dataOnDisk.Memory, token);
 		}
 
-		public bool ExistsAt(long logicalPosition) {
-			return _readSide.ExistsAt(logicalPosition);
+		_physicalDataSize = (int)GetDataPosition(workItem); // should fit 32 bits
+		_logicalDataSize = ChunkHeader.GetLocalLogPosition(record.LogPosition + length + 2 * sizeof(int));
+
+		// for non-scavenged chunk _physicalDataSize should be the same as _logicalDataSize
+		// for scavenged chunk _logicalDataSize should be at least the same as _physicalDataSize
+		if ((!ChunkHeader.IsScavenged && _logicalDataSize != _physicalDataSize)
+		    || (ChunkHeader.IsScavenged && _logicalDataSize < _physicalDataSize)) {
+			throw new Exception(
+				$"Data sizes violation. Chunk: {ChunkLocator}, IsScavenged: {ChunkHeader.IsScavenged}, LogicalDataSize: {_logicalDataSize}, PhysicalDataSize: {_physicalDataSize}.");
 		}
 
-		public void OptimizeExistsAt() {
-			if (!ChunkHeader.IsScavenged) return;
-			((TFChunkReadSideScavenged)_readSide).OptimizeExistsAt();
+		return RecordWriteResult.Successful(oldPosition, _physicalDataSize);
+
+		static MemoryOwner<byte> SerializeLogRecord(ILogRecord record, out int recordLength) {
+			var writer = new BufferWriterSlim<byte>(record.GetSizeWithLengthPrefixAndSuffix());
+			writer.Advance(sizeof(int)); // reserved for length prefix
+			record.WriteTo(ref writer);
+
+			recordLength = writer.WrittenCount - sizeof(int);
+			writer.WriteLittleEndian(recordLength); // length suffix
+
+			var buffer = writer.DetachOrCopyBuffer();
+			Debug.Assert(record.GetSizeWithLengthPrefixAndSuffix() == buffer.Length);
+
+			// write length prefix
+			BinaryPrimitives.WriteInt32LittleEndian(buffer.Span, recordLength);
+			return buffer;
+		}
+	}
+
+	public async ValueTask<bool> TryAppendRawData(ReadOnlyMemory<byte> buffer, CancellationToken token) {
+		var workItem = _writerWorkItem;
+		if (workItem.WorkingStream.Position + buffer.Length > workItem.WorkingStream.Length)
+			return false;
+		await workItem.AppendData(buffer, token);
+		return true;
+	}
+
+	public ValueTask Flush(CancellationToken token)
+		=> IsReadOnly ? ValueTask.CompletedTask : _writerWorkItem.FlushToDisk(token);
+
+	public ValueTask Complete(CancellationToken token) {
+		return ChunkHeader.IsScavenged
+			? ValueTask.FromException(
+				new InvalidOperationException("CompleteScavenged should be used for scavenged chunks."))
+			: CompleteNonRaw(null, token);
+	}
+
+	public ValueTask CompleteScavenge(IReadOnlyCollection<PosMap> mapping, CancellationToken token) {
+		return ChunkHeader.IsScavenged
+			? CompleteNonRaw(mapping, token)
+			: ValueTask.FromException(
+				new InvalidOperationException("CompleteScavenged should not be used for non-scavenged chunks."));
+	}
+
+	private async ValueTask CompleteNonRaw(IReadOnlyCollection<PosMap> mapping, CancellationToken token) {
+		if (IsReadOnly)
+			throw new InvalidOperationException("Cannot complete a read-only TFChunk.");
+
+		_chunkFooter = await WriteFooter(mapping, token); // WriteFooter always calls Flush
+
+		// cannot be canceled from here on
+		if (!_inMem) {
+			await _fileSystem.SetReadOnlyAsync(ChunkLocator, true, CancellationToken.None);
 		}
 
-		public void DeOptimizeExistsAt() {
-			if (!ChunkHeader.IsScavenged) return;
-			((TFChunkReadSideScavenged)_readSide).DeOptimizeExistsAt();
+		if (!_inMem) {
+			CreateReaderStreams();
 		}
 
-		public RecordReadResult TryReadAt(long logicalPosition) {
-			return _readSide.TryReadAt(logicalPosition);
+		IsReadOnly = true;
+
+		_writerWorkItem?.Dispose();
+		_writerWorkItem = null;
+	}
+
+	public async ValueTask CompleteRaw(CancellationToken token) {
+		if (IsReadOnly)
+			throw new InvalidOperationException("Cannot complete a read-only TFChunk.");
+		if (_writerWorkItem.WorkingStream.Position != _writerWorkItem.WorkingStream.Length)
+			throw new InvalidOperationException("The raw chunk is not completely written.");
+
+		await Flush(token);
+
+		if (!_inMem) {
+			await _fileSystem.SetReadOnlyAsync(ChunkLocator, true, token);
+			await using var stream = _handle.CreateStream();
+			_chunkFooter = await ReadFooter(stream, token);
+		} else {
+			_chunkFooter = await ReadFooter(_sharedMemStream, token);
 		}
 
-		public RecordReadResult TryReadFirst() {
-			return _readSide.TryReadFirst();
-		}
+		// cannot be canceled from here on
+		if (!_inMem)
+			CreateReaderStreams();
 
-		public RecordReadResult TryReadClosestForward(long logicalPosition) {
-			return _readSide.TryReadClosestForward(logicalPosition);
-		}
+		IsReadOnly = true;
 
-		public RecordReadResult TryReadLast() {
-			return _readSide.TryReadLast();
-		}
+		_writerWorkItem?.Dispose();
+		_writerWorkItem = null;
+	}
 
-		public RecordReadResult TryReadClosestBackward(long logicalPosition) {
-			return _readSide.TryReadClosestBackward(logicalPosition);
-		}
+	private async ValueTask<ChunkFooter> WriteFooter(IReadOnlyCollection<PosMap> mapping, CancellationToken token) {
+		token.ThrowIfCancellationRequested();
 
-		public RecordWriteResult TryAppend(ILogRecord record) {
-			if (_isReadOnly)
-				throw new InvalidOperationException("Cannot write to a read-only block.");
+		// cannot be canceled from here on
+		var workItem = _writerWorkItem;
+		int mapSize;
 
-			var workItem = _writerWorkItem;
-			var buffer = workItem.Buffer;
-			var bufferWriter = workItem.BufferWriter;
-
-			buffer.SetLength(4);
-			buffer.Position = 4;
-			record.WriteTo(bufferWriter);
-			var length = (int)buffer.Length - 4;
-			bufferWriter.Write(length); // length suffix
-			buffer.Position = 0;
-			bufferWriter.Write(length); // length prefix
-
-			if (workItem.StreamPosition + length + 2 * sizeof(int) > ChunkHeader.Size + _chunkHeader.ChunkSize)
-				return RecordWriteResult.Failed(GetDataPosition(workItem));
-
-			var oldPosition = WriteRawData(workItem, buffer);
-			_physicalDataSize = (int)GetDataPosition(workItem); // should fit 32 bits
-			_logicalDataSize = ChunkHeader.GetLocalLogPosition(record.LogPosition + length + 2 * sizeof(int));
-
-			// for non-scavenged chunk _physicalDataSize should be the same as _logicalDataSize
-			// for scavenged chunk _logicalDataSize should be at least the same as _physicalDataSize
-			if ((!ChunkHeader.IsScavenged && _logicalDataSize != _physicalDataSize)
-			    || (ChunkHeader.IsScavenged && _logicalDataSize < _physicalDataSize)) {
-				throw new Exception(string.Format(
-					"Data sizes violation. Chunk: {0}, IsScavenged: {1}, LogicalDataSize: {2}, PhysicalDataSize: {3}.",
-					FileName, ChunkHeader.IsScavenged, _logicalDataSize, _physicalDataSize));
-			}
-
-			return RecordWriteResult.Successful(oldPosition, _physicalDataSize);
-		}
-
-		public bool TryAppendRawData(byte[] buffer) {
-			var workItem = _writerWorkItem;
-			if (workItem.StreamPosition + buffer.Length > workItem.StreamLength)
-				return false;
-			WriteRawData(workItem, buffer, buffer.Length);
-			return true;
-		}
-
-		private static long WriteRawData(WriterWorkItem workItem, MemoryStream buffer) {
-			var len = (int)buffer.Length;
-			var buf = buffer.GetBuffer();
-			return WriteRawData(workItem, buf, len);
-		}
-
-		private static long WriteRawData(WriterWorkItem workItem, byte[] buf, int len) {
-			var curPos = GetDataPosition(workItem);
-			workItem.MD5.TransformBlock(buf, 0, len, null, 0);
-			workItem.AppendData(buf, 0, len);
-			return curPos;
-		}
-
-		public void Flush() {
+		// reuse rented buffer for position mapping serialization and chunk footer
+		byte[] bufferFromPool;
+		if (mapping is null) {
+			mapSize = 0;
+			bufferFromPool = ArrayPool<byte>.Shared.Rent(ChunkFooter.Size);
+		} else {
 			if (_inMem)
-				return;
-			if (_isReadOnly)
-				throw new InvalidOperationException("Cannot write to a read-only TFChunk.");
-			_writerWorkItem.FlushToDisk();
-		}
+				throw new InvalidOperationException(
+					"Cannot write an in-memory chunk with a PosMap. " +
+					"Scavenge is not supported on in-memory databases");
 
-		public void Complete() {
-			if (ChunkHeader.IsScavenged)
-				throw new InvalidOperationException("CompleteScavenged should be used for scavenged chunks.");
-			CompleteNonRaw(null);
-		}
-
-		public void CompleteScavenge(ICollection<PosMap> mapping) {
-			if (!ChunkHeader.IsScavenged)
-				throw new InvalidOperationException("CompleteScavenged should not be used for non-scavenged chunks.");
-
-			CompleteNonRaw(mapping);
-		}
-
-		private void CompleteNonRaw(ICollection<PosMap> mapping) {
-			if (_isReadOnly)
-				throw new InvalidOperationException("Cannot complete a read-only TFChunk.");
-
-			_chunkFooter = WriteFooter(mapping);
-			Flush();
-			_isReadOnly = true;
-
-			CleanUpWriterWorkItem(_writerWorkItem);
-			_writerWorkItem = null;
-			SetAttributes(_filename, true);
-		}
-
-		public void CompleteRaw() {
-			if (_isReadOnly)
-				throw new InvalidOperationException("Cannot complete a read-only TFChunk.");
-			if (_writerWorkItem.StreamPosition != _writerWorkItem.StreamLength)
-				throw new InvalidOperationException("The raw chunk is not completely written.");
-			Flush();
-			_chunkFooter = ReadFooter(_writerWorkItem.WorkingStream);
-			_isReadOnly = true;
-
-			CleanUpWriterWorkItem(_writerWorkItem);
-			_writerWorkItem = null;
-			SetAttributes(_filename, true);
-		}
-
-		private ChunkFooter WriteFooter(ICollection<PosMap> mapping) {
-			var workItem = _writerWorkItem;
-			workItem.ResizeStream((int)workItem.StreamPosition);
-
-			int mapSize = 0;
-			if (mapping != null) {
-				if (!_inMem && _isCached != 0) {
-					throw new InvalidOperationException("Trying to write mapping while chunk is cached. "
-					                                    + "You probably are writing scavenged chunk as cached. "
-					                                    + "Do not do this.");
-				}
-
-				mapSize = mapping.Count * PosMap.FullSize;
-				workItem.Buffer.SetLength(mapSize);
-				workItem.Buffer.Position = 0;
-				foreach (var map in mapping) {
-					map.Write(workItem.BufferWriter);
-				}
-
-				if (_inMem)
-					ResizeMemStream(workItem, mapSize);
-				WriteRawData(workItem, workItem.Buffer);
+			if (_cacheStatus is not CacheStatus.Uncached) {
+				throw new InvalidOperationException("Trying to write mapping while chunk is cached. "
+				                                    + "You probably are writing scavenged chunk as cached. "
+				                                    + "Do not do this.");
 			}
 
-			workItem.FlushToDisk();
+			mapSize = mapping.Count * PosMap.FullSize;
 
-			if (_chunkHeader.Version >= (byte)ChunkVersions.Aligned) {
-				var alignedSize = GetAlignedSize(ChunkHeader.Size + _physicalDataSize + mapSize + ChunkFooter.Size);
-				var bufferSize = alignedSize - workItem.StreamPosition - ChunkFooter.Size;
-				Log.Debug("Buffer size is {bufferSize}", bufferSize);
-				if (bufferSize > 0) {
-					byte[] buffer = new byte[bufferSize];
-					WriteRawData(workItem, buffer, buffer.Length);
-				}
-			}
+			bufferFromPool = ArrayPool<byte>.Shared.Rent(Math.Max(mapSize, ChunkFooter.Size));
+			mapSize = WriteMapping(bufferFromPool, mapping);
+			await workItem.AppendData(bufferFromPool.AsMemory(0, mapSize), CancellationToken.None);
+		}
 
-			Flush();
+		await _transform.Write.CompleteData(
+			footerSize: ChunkFooter.Size,
+			alignmentSize: _chunkHeader.Version >= (byte)ChunkVersions.Aligned ? AlignmentSize : 1,
+			CancellationToken.None);
 
-			var footerNoHash = new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize,
-				new byte[ChunkFooter.ChecksumSize]);
+		int fileSize;
+		ChunkFooter footerWithHash;
+		try {
+			var footerNoHash = new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize);
+
 			//MD5
-			workItem.MD5.TransformFinalBlock(footerNoHash.AsByteArray(), 0,
+			footerNoHash.Format(bufferFromPool);
+			workItem.MD5.AppendData(bufferFromPool, 0,
 				ChunkFooter.Size - ChunkFooter.ChecksumSize);
+
 			//FILE
-			var footerWithHash =
-				new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize, workItem.MD5.Hash);
-			workItem.AppendData(footerWithHash.AsByteArray(), 0, ChunkFooter.Size);
-
-			Flush();
-
-			_fileSize = (int)workItem.StreamLength;
-			return footerWithHash;
+			footerWithHash = new ChunkFooter(true, true, _physicalDataSize, LogicalDataSize, mapSize, workItem.MD5);
+			footerWithHash.Format(bufferFromPool);
+			fileSize = await _transform.Write.WriteFooter(new(bufferFromPool, 0, ChunkFooter.Size), CancellationToken.None);
+		} finally {
+			ArrayPool<byte>.Shared.Return(bufferFromPool);
 		}
 
-		private void ResizeMemStream(WriterWorkItem workItem, int mapSize) {
-			var newFileSize = (int)workItem.StreamPosition + mapSize + ChunkFooter.Size;
-			if (workItem.StreamLength < newFileSize) {
-				var pos = workItem.StreamPosition;
-				var newCachedData = Marshal.AllocHGlobal(newFileSize);
-				var memStream = new UnmanagedMemoryStream((byte*)newCachedData,
-					workItem.StreamLength,
-					newFileSize,
-					FileAccess.ReadWrite);
-				workItem.WorkingStream.Position = 0;
-				workItem.WorkingStream.CopyTo(memStream);
+		// at this point in code, 'WorkingStream` should not contain buffered bytes because SeLength
+		// can cause sync-over-async write. This fact is checked within `IChunkHandle.UnbufferedStream` class
+		workItem.ResizeFileStream(fileSize);
 
-				if (!TryDestructMemStreams())
-					throw new Exception("MemStream readers are in use when writing scavenged chunk.");
+		_fileSize = fileSize;
+		return footerWithHash;
 
-				_cachedLength = newFileSize;
-				_cachedData = newCachedData;
-
-				memStream.Position = pos;
-				workItem.SetMemStream(memStream);
-
-				// READER STREAMS
-				Interlocked.Add(ref _memStreamCount, _maxReaderCount);
-				for (int i = 0; i < _maxReaderCount; i++) {
-					var stream = new UnmanagedMemoryStream((byte*)_cachedData, _cachedLength);
-					var reader = new BinaryReader(stream);
-					_memStreams.Enqueue(new ReaderWorkItem(stream, reader, isMemory: true));
-				}
-			}
-		}
-
-		private void CleanUpWriterWorkItem(WriterWorkItem writerWorkItem) {
-			if (writerWorkItem == null)
-				return;
-			writerWorkItem.Dispose();
-		}
-
-		public void Dispose() {
-			_selfdestructin54321 = true;
-			TryDestructFileStreams();
-			TryDestructMemStreams();
-		}
-
-		public void MarkForDeletion() {
-			_selfdestructin54321 = true;
-			_deleteFile = true;
-			TryDestructFileStreams();
-			TryDestructMemStreams();
-		}
-
-		private void TryDestructFileStreams() {
-			int fileStreamCount = int.MaxValue;
-
-			ReaderWorkItem workItem;
-			while (_fileStreams.TryDequeue(out workItem)) {
-				workItem.Stream.Dispose();
-				fileStreamCount = Interlocked.Decrement(ref _fileStreamCount);
+		static int WriteMapping(Span<byte> buffer, IReadOnlyCollection<PosMap> mapping) {
+			var writer = new SpanWriter<byte>(buffer);
+			foreach (var map in mapping) {
+				writer.Write(map);
 			}
 
-			if (fileStreamCount < 0)
+			return writer.WrittenCount;
+		}
+	}
+
+	public void Dispose() => TryClose();
+
+	public bool TryClose() {
+		_selfdestructin54321 = true;
+
+		Thread.MemoryBarrier();
+
+		bool closed = true;
+		closed &= TryDestructFileStreams();
+		closed &= TryDestructMemStreams();
+
+		return closed;
+	}
+
+	// Causes the chunk to be deleted when all the readers have returned.
+	public void MarkForDeletion() {
+		_selfdestructin54321 = true;
+		_deleteFile = true;
+
+		Thread.MemoryBarrier();
+
+		TryDestructFileStreams();
+		TryDestructMemStreams();
+	}
+
+	private bool TryDestructFileStreams() {
+		switch (_fileStreams.Drain(ref _fileStreamCount)) {
+			case < 0:
 				throw new Exception("Count of file streams reduced below zero.");
-			if (fileStreamCount == 0) // we are the last who should "turn the light off" for file streams
+			case 0:
 				CleanUpFileStreamDestruction();
-		}
-
-		private void CleanUpFileStreamDestruction() {
-			CleanUpWriterWorkItem(_writerWorkItem);
-
-			if (!_inMem) {
-				Helper.EatException(() => File.SetAttributes(_filename, FileAttributes.Normal));
-
-				if (_deleteFile) {
-					Log.Information("File {chunk} has been marked for delete and will be deleted in TryDestructFileStreams.",
-						Path.GetFileName(_filename));
-					Helper.EatException(() => File.Delete(_filename));
-				}
-			}
-
-			_destroyEvent.Set();
-		}
-
-		public static int GetAlignedSize(int size) {
-			if (size % 4096 == 0) return size;
-			return (size / 4096 + 1) * 4096;
-		}
-
-		private bool TryDestructMemStreams() {
-			var writerWorkItem = _writerWorkItem;
-			if (writerWorkItem != null)
-				writerWorkItem.DisposeMemStream();
-
-			int memStreamCount = int.MaxValue;
-
-			ReaderWorkItem workItem;
-			while (_memStreams.TryDequeue(out workItem)) {
-				memStreamCount = Interlocked.Decrement(ref _memStreamCount);
-			}
-
-			if (memStreamCount < 0)
-				throw new Exception("Count of memory streams reduced below zero.");
-			if (memStreamCount == 0) // we are the last who should "turn the light off" for memory streams
-			{
-				FreeCachedData();
 				return true;
+			default:
+				return false;
+		}
+	}
+
+	// Called when the filestreams have all been returned and disposed.
+	// This used to be a 'last one out turns off the light' mechanism, but now it is idempotent
+	// so it is more like 'make sure the light is off if no one is using it'.
+	// The idempotency means that
+	//  1. we don't have to worry if we just disposed the last filestream or if someone else did before.
+	//  2. this mechanism will work if we decide not to create any pooled filestreams at all
+	//        (previously if we didnt create any filestreams then no one would call this method)
+	private void CleanUpFileStreamDestruction() {
+		if (Interlocked.CompareExchange(ref _cleanedUpFileStreams, 1, 0) is not 0)
+			return;
+
+		if (_writerWorkItem is not null) {
+			_writerWorkItem.FlushToDisk();
+			_writerWorkItem.Dispose();
+		}
+
+		if (!_inMem) {
+			_handle?.Dispose();
+			Helper.EatException(LocalFileName, static filename => File.SetAttributes(filename, FileAttributes.Normal));
+
+			if (_deleteFile) {
+				Log.Information("Deleting chunk {chunk}",
+					Path.GetFileName(ChunkLocator));
+				Helper.EatException(LocalFileName, File.Delete);
+			}
+		}
+
+		_destroyEvent.Set();
+	}
+
+	public static int GetAlignedSize(int size) {
+		if (size % AlignmentSize == 0) return size;
+		return (size / AlignmentSize + 1) * AlignmentSize;
+	}
+
+	// the caller must be responsible to obtain the lock to call this method
+	private bool TryDestructMemStreamsUnsafe() {
+		Debug.Assert(_cachedDataLock.IsLockHeld);
+
+		if (_cacheStatus is not CacheStatus.Uncaching && !_selfdestructin54321)
+			return false;
+
+		_writerWorkItem?.DisposeMemStream();
+
+		switch (_memStreams.Drain(ref _memStreamCount)) {
+			case < 0:
+				throw new Exception("Count of memory streams reduced below zero.");
+			case 0:
+				// make sure "the light is off" for memory streams
+				FreeCachedDataUnsafe();
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private bool TryDestructMemStreams() {
+		_cachedDataLock.TryAcquire(InfiniteTimeSpan);
+		try {
+			return TryDestructMemStreamsUnsafe();
+		} finally {
+			_cachedDataLock.Release();
+		}
+	}
+
+	// the caller must be responsible to obtain the lock to call this method
+	private void FreeCachedDataUnsafe() {
+		Debug.Assert(_cachedDataLock.IsLockHeld);
+
+		var cachedData = _cachedData;
+		if (cachedData is not 0) {
+			Marshal.FreeHGlobal(cachedData);
+			GC.RemoveMemoryPressure(_cachedLength);
+			_cachedData = 0;
+			_cachedLength = 0;
+			_cacheStatus = CacheStatus.Uncached;
+			Interlocked.Exchange(ref _sharedMemStream, null)?.Dispose();
+			Log.Debug("UNCACHED TFChunk {chunk}.", this);
+		}
+	}
+
+	private void FreeCachedData() {
+		_cachedDataLock.TryAcquire(InfiniteTimeSpan);
+		try {
+			FreeCachedDataUnsafe();
+		} finally {
+			_cachedDataLock.Release();
+		}
+	}
+
+	public void WaitForDestroy(int timeoutMs) {
+		if (!_destroyEvent.Wait(timeoutMs))
+			throw new TimeoutException();
+	}
+
+	private ReaderWorkItem GetReaderWorkItem() {
+		if (_selfdestructin54321)
+			throw new FileBeingDeletedException();
+
+		// try get memory stream reader first
+		if (_memStreams.TryTake(out var slot)) {
+			// When caching, _cachedDataTransformed and _sharedMemStream are both set before
+			// _memStreams.Reuse() (which repopulates the pool that was definitely empty)
+			// The Interlocked.Add(_memStreamCount) barrier guarantees the order.
+			// So since we have got a slot from the pool, we are guaranteed that _sharedMemStream and
+			// _cachedDataTransformed are populated with the correct values and further more their
+			// values will not change because we have the slot, preventing any uncaching.
+			Debug.Assert(_sharedMemStream is not null);
+
+			if (slot.ValueRef is not { } memoryWorkItem) {
+				memoryWorkItem = slot.ValueRef = new(
+					_sharedMemStream,
+					_cachedDataTransformed ? _transform.Read : IdentityChunkReadTransform.Instance) { PositionInPool = slot.Index };
 			}
 
+			return memoryWorkItem;
+		} else if (_selfdestructin54321) {
+			throw new FileBeingDeletedException();
+		} else if (Atomic.UpdateAndGet(ref _memStreamCount, IncrementIfGreaterThanZero) > 0) {
+			// We did not get a slot from the pool, but we incremented _memStreamCount from an
+			// already positive number. This means there are other mem readers in existence so we can
+			// create a new one separate to the pool because their existence guarantees that
+			// _sharedMemStream and _cachedDataTransformed are populated and will not change until
+			// _memStreamCount returns to 0.
+			//
+			// If the number of mem readers in existence had dropped to 0 then the uncaching
+			// procedure may be in progress and _sharedMemStream and _cachedDataTransformed may
+			// change or become invalid, so we don't use them. Instead fallback to filestream.
+			Debug.Assert(_sharedMemStream is not null);
+
+			return new(_sharedMemStream, _cachedDataTransformed ? _transform.Read : IdentityChunkReadTransform.Instance);
+		}
+
+		if (!IsReadOnly) {
+			// chunks cannot be read using filestreams while they can still be written to
+			throw new Exception(_cacheStatus is not CacheStatus.Cached
+				? "Active chunk must be cached but was not."
+				: "Not enough memory streams for active chunk.");
+		}
+
+		// get a filestream from the pool, or create one if the pool is empty.
+		if (_fileStreams.TryTake(out slot)) {
+			if (slot.ValueRef is not { } fileStreamWorkItem)
+				slot.ValueRef = fileStreamWorkItem = new(_handle, _transform.Read, IsRemote) { PositionInPool = slot.Index };
+
+			return fileStreamWorkItem;
+		}
+
+		Interlocked.Increment(ref _fileStreamCount);
+
+		if (_selfdestructin54321) {
+			if (Interlocked.Decrement(ref _fileStreamCount) == 0)
+				CleanUpFileStreamDestruction();
+			throw new FileBeingDeletedException();
+		}
+
+		return new(_handle, _transform.Read, IsRemote);
+
+		static int IncrementIfGreaterThanZero(int value)
+			=> value + Unsafe.BitCast<bool, byte>(value > 0);
+	}
+
+	private void ReturnReaderWorkItem(ReaderWorkItem item) {
+		if (item.IsMemory) {
+			// we avoid taking the _cachedDataLock here every time because we would be
+			// contending with other reader threads also returning readerworkitems.
+			//
+			// instead we check _cacheStatus to give us a hint about whether we need to lock.
+			// but this read of _cacheStatus is not inside the lock, so it can be wrong
+			// because we read a stale value, or it changed immediately after
+			// we read it.
+			//
+			// if the check is wrong it can result in one of two outcomes:
+			// 1. we call TryDestructMemStreams when we shouldn't.
+			//    we protect against this by checking the condition again inside the lock
+			// 2. we don't call TryDestructMemStreams when we should.
+			//    the memory barrier, corresponding to the barrier in UnCacheFromMemory, protects
+			//    against this by guaranteeing ordering as emphasied in _italics_ below.
+			//    the case protected against is that another thread might call UnCacheFromMemory just as
+			//    we are returning an item here and neither thread tidys up the item we are returning.
+			//    but consider: UnCacheFromMemory sets the state to Uncaching _and then_ tidys up the
+			//    items in the pool. if it does not tidy up our item, it is because our item wasn't
+			//    in the pool. which means we hadn't enqueued it yet, which means that we will
+			//    enqueue it and then _after that_ read _cacheStatus and find it is Uncaching,
+			//    which means we will tidy it up here.
+			//    this works in the same way as the barriers in ObjectPool.cs
+			//
+			// if we do end up needing to take the lock the risk of having to wait a long time is
+			// low (or possibly none), because Caching is the only slow operation while holding
+			// the lock and it only occurs when there are no outstanding memory readers, but we know
+			// there is one currently because we are in the process of returning it.
+			if (!_memStreams.Return(item)) {
+				// item was not taken from the pool, destroy immediately
+				item.Dispose();
+				Interlocked.Decrement(ref _memStreamCount);
+			}
+
+			Thread.MemoryBarrier();
+			if (_cacheStatus is CacheStatus.Uncaching || _selfdestructin54321)
+				TryDestructMemStreams();
+		} else {
+			if (!_fileStreams.Return(item)) {
+				// item was not taken from the pool, destroy immediately
+				item.Dispose();
+				Interlocked.Decrement(ref _fileStreamCount);
+			}
+
+			if (_selfdestructin54321)
+				TryDestructFileStreams();
+		}
+	}
+
+	public ValueTask<TFChunkBulkReader> AcquireDataReader(CancellationToken token) {
+		return TryAcquireBulkMemReader(raw: false, out var reader)
+			? ValueTask.FromResult(reader)
+			: AcquireFileReader(raw: false, token);
+	}
+
+	public ValueTask<TFChunkBulkReader> AcquireRawReader(CancellationToken token) {
+		return TryAcquireBulkMemReader(raw: true, out var reader)
+			? ValueTask.FromResult(reader)
+			: AcquireFileReader(raw: true, token);
+	}
+
+	private async ValueTask<TFChunkBulkReader> AcquireFileReader(bool raw, CancellationToken token) {
+		Interlocked.Increment(ref _fileStreamCount);
+		if (_selfdestructin54321) {
+			if (Interlocked.Decrement(ref _fileStreamCount) == 0) {
+				CleanUpFileStreamDestruction();
+			}
+
+			throw new FileBeingDeletedException();
+		}
+
+		// if we get here, then we reserved TFChunk for sure so no one should dispose of chunk file
+		// until client returns dedicated reader
+		var stream = await CreateFileStreamForBulkReader(token);
+
+		if (raw) {
+			return new TFChunkBulkRawReader(this, stream, isMemory: false);
+		}
+
+		var streamToUse = _transform.Read.TransformData(new ChunkDataReadStream(stream));
+		return new TFChunkBulkDataReader(this, streamToUse, isMemory: false);
+	}
+
+	private unsafe UnmanagedMemoryStream CreateMemoryStream(int length, FileAccess access = FileAccess.Read) =>
+		new((byte*)_cachedData, length, length, access);
+
+	private async ValueTask<Stream> CreateFileStreamForBulkReader(CancellationToken token) {
+		if (_inMem)
+			return CreateMemoryStream(_fileSize);
+
+		var handle = await _fileSystem.OpenForReadAsync(
+			ChunkLocator,
+			IChunkFileSystem.ReadOptimizationHint.SequentialScan,
+			token);
+
+		return new PoolingBufferedStream(handle.CreateStream(leaveOpen: false)) {
+			MaxBufferSize = 65536
+		};
+	}
+
+	// tries to acquire a bulk reader over a memstream but
+	// (a) doesn't block if a file reader would be acceptable instead
+	//     (we might be in the middle of caching which could take a while)
+	// (b) _does_ throw if we can't get a memstream and a filestream is not acceptable
+	private bool TryAcquireBulkMemReader(bool raw, out TFChunkBulkReader reader) {
+		reader = null;
+
+		if (IsReadOnly) {
+			// chunk is definitely readonly and will remain so, so a filestream would be acceptable.
+			// we might be able to get a memstream but we don't want to wait for the lock in case we
+			// are currently performing a slow operation with it such as caching.
+			if (!_cachedDataLock.TryAcquire())
+				return false;
+
+			try {
+				return TryCreateBulkMemReaderUnsafe(raw, out reader);
+			} finally {
+				_cachedDataLock.Release();
+			}
+		}
+
+		// chunk is not readonly so it should be cached and let us create a mem reader
+		// (but might become readonly at any moment!)
+		if (TryCreateBulkMemReader(raw, out reader))
+			return true;
+
+		// we couldn't get a memreader, maybe we just became readonly and got uncached.
+		if (IsReadOnly) {
+			// we did become readonly, it is acceptable to fall back to filestream.
+			return false;
+		} else {
+			// we are not yet readonly, we shouldn't have failed to get a memstream and we
+			// cannot fall back to file stream.
+			throw new Exception("Failed to get a MemStream bulk reader for a non-readonly chunk.");
+		}
+	}
+
+	// 'unsafe' because _cachedDataLock must be acquired first
+	private bool TryCreateBulkMemReaderUnsafe(bool raw, out TFChunkBulkReader reader) {
+		Debug.Assert(_cachedDataLock.IsLockHeld);
+
+		if (_cacheStatus is not CacheStatus.Cached) {
+			reader = null;
 			return false;
 		}
 
-		private void FreeCachedData() {
-			var cachedData = Interlocked.Exchange(ref _cachedData, IntPtr.Zero);
-			if (cachedData != IntPtr.Zero)
-				Marshal.FreeHGlobal(cachedData);
-		}
+		if (_cachedData is 0)
+			throw new Exception("Unexpected error: a cached chunk had no cached data");
 
-		public void WaitForDestroy(int timeoutMs) {
-			if (!_destroyEvent.Wait(timeoutMs))
-				throw new TimeoutException();
-		}
+		Interlocked.Increment(ref _memStreamCount);
+		var stream = CreateMemoryStream(_cachedLength);
 
-		private ReaderWorkItem GetReaderWorkItem() {
-			if (_selfdestructin54321)
-				throw new FileBeingDeletedException();
-
-			ReaderWorkItem item;
-			// try get memory stream reader first
-			if (_memStreams.TryDequeue(out item))
-				return item;
-
-			if (_inMem)
-				throw new Exception("Not enough memory streams during in-mem TFChunk mode.");
-
-			if (_fileStreams.TryDequeue(out item))
-				return item;
-
-			if (_selfdestructin54321)
-				throw new FileBeingDeletedException();
-
-			var internalStreamCount = Interlocked.Increment(ref _internalStreamsCount);
-			if (internalStreamCount > _maxReaderCount)
-				throw new Exception("Unable to acquire reader work item. Max internal streams limit reached.");
-
-			Interlocked.Increment(ref _fileStreamCount);
-			if (_selfdestructin54321) {
-				if (Interlocked.Decrement(ref _fileStreamCount) == 0)
-					CleanUpFileStreamDestruction(); // now we should "turn light off"
-				throw new FileBeingDeletedException();
+		if (raw) {
+			if (!_cachedDataTransformed) {
+				// we want a raw reader for a cached chunk (which should return transformed data)
+				// but the cached data is not transformed so we can't use it directly.
+				// (likely this chunk was cached before it was completed)
+				reader = null;
+				return false;
 			}
-
-			// if we get here, then we reserved TFChunk for sure so no one should dispose of chunk file
-			// until client returns the reader
-			return CreateInternalReaderWorkItem();
+			reader = new TFChunkBulkRawReader(chunk: this, streamToUse: stream, isMemory: true);
+			return true;
 		}
 
-		private void ReturnReaderWorkItem(ReaderWorkItem item) {
-			if (item.IsMemory) {
-				_memStreams.Enqueue(item);
-				if (_isCached == 0 || _selfdestructin54321)
+		var streamToUse = new ChunkDataReadStream(stream);
+		streamToUse = (_cachedDataTransformed
+			? _transform.Read
+			: IdentityChunkReadTransform.Instance).TransformData(streamToUse);
+
+		reader = new TFChunkBulkDataReader(chunk: this, streamToUse: streamToUse, isMemory: true);
+
+		return true;
+	}
+
+	// creates a bulk reader over a memstream as long as we are cached
+	private bool TryCreateBulkMemReader(bool raw, out TFChunkBulkReader reader) {
+		_cachedDataLock.TryAcquire(InfiniteTimeSpan);
+		try {
+			return TryCreateBulkMemReaderUnsafe(raw, out reader);
+		} finally {
+			_cachedDataLock.Release();
+		}
+	}
+
+	public void ReleaseReader(TFChunkBulkReader reader) {
+		if (reader.IsMemory) {
+			switch (Interlocked.Decrement(ref _memStreamCount)) {
+				case < 0:
+					throw new Exception("Count of mem streams reduced below zero.");
+				case 0:
 					TryDestructMemStreams();
-			} else {
-				_fileStreams.Enqueue(item);
-				if (_selfdestructin54321)
-					TryDestructFileStreams();
-			}
-		}
-
-		public TFChunkBulkReader AcquireReader() {
-			Interlocked.Increment(ref _fileStreamCount);
-			if (_selfdestructin54321) {
-				if (Interlocked.Decrement(ref _fileStreamCount) == 0) {
-					// now we should "turn light off"
-					CleanUpFileStreamDestruction();
-				}
-
-				throw new FileBeingDeletedException();
+					break;
 			}
 
-			// if we get here, then we reserved TFChunk for sure so no one should dispose of chunk file
-			// until client returns dedicated reader
-			return new TFChunkBulkReader(this, GetSequentialReaderFileStream());
+			return;
 		}
 
-		private Stream GetSequentialReaderFileStream() {
-			return _inMem
-				? (Stream)new UnmanagedMemoryStream((byte*)_cachedData, _fileSize)
-				: new FileStream(_filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536,
-					FileOptions.SequentialScan);
-		}
-
-		public void ReleaseReader(TFChunkBulkReader reader) {
-			var fileStreamCount = Interlocked.Decrement(ref _fileStreamCount);
-			if (fileStreamCount < 0)
+		switch (Interlocked.Decrement(ref _fileStreamCount)) {
+			case < 0:
 				throw new Exception("Count of file streams reduced below zero.");
-			if (_selfdestructin54321 && fileStreamCount == 0)
+			case 0 when _selfdestructin54321:
 				CleanUpFileStreamDestruction();
+				break;
 		}
+	}
 
-		public override string ToString() {
-			return string.Format("#{0}-{1} ({2})", _chunkHeader.ChunkStartNumber, _chunkHeader.ChunkEndNumber,
-				Path.GetFileName(_filename));
-		}
+	public async IAsyncEnumerable<IChunkBlob> UnmergeAsync([EnumeratorCancellation] CancellationToken token) {
+		if (ChunkHeader.ChunkStartNumber == ChunkHeader.ChunkEndNumber)
+			throw new InvalidOperationException($"Chunk: {ChunkLocator} is not merged");
 
-		private struct Midpoint {
-			public readonly int ItemIndex;
-			public readonly long LogPos;
+		if (!ChunkHeader.IsScavenged)
+			throw new InvalidOperationException($"Chunk: {ChunkLocator} is not scavenged");
 
-			public Midpoint(int itemIndex, PosMap posmap) {
-				ItemIndex = itemIndex;
-				LogPos = posmap.LogPos;
+		if (!IsReadOnly)
+			throw new InvalidOperationException($"Chunk: {ChunkLocator} is not complete");
+
+		var recordReadResult = await TryReadClosestForward(0L, token);
+
+		for (var logicalChunkNumber = ChunkHeader.ChunkStartNumber;
+			 logicalChunkNumber <= ChunkHeader.ChunkEndNumber;
+			 logicalChunkNumber++) {
+
+			var unmerged = await Spawn(logicalChunkNumber);
+			var writer = new ScavengedChunkWriter(unmerged);
+
+			while (recordReadResult.Success) {
+				var recordChunkNumber = (int)(recordReadResult.LogRecord.LogPosition / ChunkHeader.ChunkSize);
+				if (recordChunkNumber != logicalChunkNumber)
+					break;
+				await writer.WriteRecord(recordReadResult.LogRecord, token);
+				recordReadResult = await TryReadClosestForward(recordReadResult.NextPosition, token);
 			}
 
-			public override string ToString() {
-				return string.Format("ItemIndex: {0}, LogPos: {1}", ItemIndex, LogPos);
+			await writer.Complete(token);
+			yield return unmerged;
+		}
+
+		ValueTask<TFChunk> Spawn(int logicalChunkNumber) => CreateNew(
+			_fileSystem,
+			filename: Path.Combine(Path.GetDirectoryName(_filename)!, Guid.NewGuid() + ".unmerge.tmp"),
+			chunkDataSize: _chunkHeader.ChunkSize,
+			chunkStartNumber: logicalChunkNumber,
+			chunkEndNumber: logicalChunkNumber,
+			isScavenged: true,
+			inMem: _inMem,
+			unbuffered: _unbuffered,
+			writethrough: _writeThrough,
+			reduceFileCachePressure: _reduceFileCachePressure,
+			tracker: new TFChunkTracker.NoOp(),
+			getTransformFactory: _getTransformFactory,
+			token);
+	}
+
+	async ValueTask<IChunkRawReader> IChunkBlob.AcquireRawReader(CancellationToken token)
+		=> (IChunkRawReader)await AcquireRawReader(token);
+
+	public override string ToString() {
+		return string.Format("#{0}-{1} ({2})", _chunkHeader.ChunkStartNumber, _chunkHeader.ChunkEndNumber,
+			Path.GetFileName(ChunkLocator));
+	}
+
+	[StructLayout(LayoutKind.Auto)]
+	private readonly struct Midpoint(int itemIndex, in PosMap posmap) {
+		public readonly int ItemIndex = itemIndex;
+		public readonly long LogPos = posmap.LogPos;
+
+		public override string ToString() => $"ItemIndex: {ItemIndex}, LogPos: {LogPos}";
+	}
+
+	[StructLayout(LayoutKind.Auto)]
+	private struct ReaderWorkItemPool() {
+		private volatile ReaderWorkItem[] _array;
+
+		// IndexPool supports up to 64 elements with O(1) take/return time complexity.
+		// It's a thread-safe data structure with no allocations that provide predictability about
+		// the indices: smallest available index is always preferred.
+		private IndexPool _indices = new() { IsEmpty = true };
+
+		public void Reuse() {
+			if (_array is null) {
+				Interlocked.CompareExchange(ref _array, new ReaderWorkItem[IndexPool.Capacity], null);
 			}
+
+			_indices.Reset();
+		}
+
+		// Skip index and type variance checks which is inserted by runtime typically because
+		// the array element is of reference type.
+		private static ref ReaderWorkItem UnsafeGetElement(ReaderWorkItem[] array, int index)
+		{
+			Debug.Assert((uint)index < (uint)array.Length);
+
+			return ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(array), index);
+		}
+
+		// releases all available slots in the pool
+		internal int Drain(ref int referenceCount) {
+			int localReferenceCount = Interlocked.CompareExchange(ref referenceCount, 0, 0);
+
+			if (_array is { } array && localReferenceCount > 0) {
+				Span<int> indices = stackalloc int[IndexPool.Capacity];
+				int count = _indices.Take(indices);
+
+				foreach (var index in indices.Slice(0, count)) {
+					ref ReaderWorkItem slot = ref UnsafeGetElement(array, index);
+					slot?.Dispose();
+					slot = null;
+
+					localReferenceCount = Interlocked.Decrement(ref referenceCount);
+				}
+			}
+
+			return localReferenceCount;
+		}
+
+		internal bool TryTake(out Slot slot) {
+			if (_array is { } array && _indices.TryTake(out int index)) {
+				slot = new(array, index);
+				return true;
+			}
+
+			slot = default;
+			return false;
+		}
+
+		internal bool Return(ReaderWorkItem item) {
+			int index = item.PositionInPool;
+			if (index < 0)
+				return false;
+
+			_indices.Return(index);
+			return true;
+		}
+
+		[StructLayout(LayoutKind.Auto)]
+		internal readonly ref struct Slot(ReaderWorkItem[] array, int index) {
+			public int Index => index;
+
+			public ref ReaderWorkItem ValueRef => ref UnsafeGetElement(array, index);
 		}
 	}
 }
